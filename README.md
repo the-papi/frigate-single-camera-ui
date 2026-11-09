@@ -55,6 +55,10 @@ Installing needs **HTTPS** (except on `localhost`), e.g. via the Traefik setup a
 
 It then opens fullscreen with its own icon, like a native app.
 
+After signing in, the app shows its own install banner: an **Install** button on Android /
+Chrome / Edge, or the Share → Add to Home Screen steps on iPhone / iPad (iOS has no install
+prompt for websites). It is hidden inside the installed app and after closing it stays away for 30 days.
+
 ## How it works
 
 `app/main.py` is a small FastAPI proxy. Signing in posts the credentials to Frigate's

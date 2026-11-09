@@ -128,6 +128,17 @@
     </div>
   </div>
 
+  <!-- ==================================== "install the app" banner -->
+  <div id="installBanner" class="install-banner" role="dialog" aria-labelledby="installTitle" hidden>
+    <img src="/static/icons/icon-192.png" alt="" class="install-icon">
+    <div class="install-text">
+      <div id="installTitle" class="install-title">Install the app</div>
+      <div id="installSub" class="install-sub"></div>
+    </div>
+    <button class="btn filled" id="installBtn" hidden>Install</button>
+    <button class="icon-btn small" id="installClose" aria-label="Not now" title="Not now"><span class="icon">close</span></button>
+  </div>
+
   <div id="toast" class="snackbar" hidden></div>
   <script src="/static/app.js"></script>
 </body>

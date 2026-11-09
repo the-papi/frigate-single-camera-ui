@@ -422,3 +422,19 @@ a.btn { text-decoration: none; }
 .sheet-status.error .mini-spinner, .sheet-status.done .mini-spinner { display: none; }
 .sheet video { margin-bottom: 16px; }
 .sheet-info { margin: 0 0 12px; }
+
+/* install banner */
+.install-banner {
+  position: fixed; z-index: 15; left: 50%; transform: translateX(-50%);
+  bottom: calc(12px + var(--safe-b));
+  width: min(560px, calc(100vw - 24px - var(--safe-l) - var(--safe-r)));
+  display: flex; align-items: center; gap: 12px; padding: 12px 8px 12px 12px;
+  background: var(--md-surface-container-high); color: var(--md-on-surface);
+  border-radius: var(--shape-l); box-shadow: var(--elev-3);
+  animation: snack-in .25s ease-out;
+}
+.install-icon { width: 44px; height: 44px; border-radius: 12px; flex: none; }
+.install-text { flex: 1; min-width: 0; }
+.install-title { font-size: 15px; font-weight: 500; line-height: 20px; }
+.install-sub { font-size: 13px; line-height: 18px; color: var(--md-on-surface-variant); }
+.install-sub .icon { font-size: 17px; vertical-align: -3px; color: var(--md-primary); }

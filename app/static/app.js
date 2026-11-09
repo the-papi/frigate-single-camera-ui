@@ -976,6 +976,7 @@ function stopEverything() {
 function showLogin(message) {
   stopEverything();
   $('app').hidden = true;
+  $('installBanner').hidden = true;
   $('login').hidden = false;
   $('loginError').hidden = !message;
   $('loginError').textContent = message || '';
@@ -1018,6 +1019,66 @@ $('logout').onclick = async () => {
   showLogin();
 };
 
+// --------------------------------------------------------- install prompt
+//
+// Chromium (Android, desktop) fires `beforeinstallprompt` when the app is
+// installable – we keep it and show our own banner with an Install button.
+// iOS has no such API, so there we explain Share → Add to Home Screen.
+
+const INSTALL_SNOOZE_DAYS = 30;
+const isStandalone = matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+              (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1); // iPadOS
+let installEvent = null;
+
+function installSnoozed() {
+  try {
+    const t = Number(localStorage.getItem('installDismissed') || 0);
+    return Date.now() - t < INSTALL_SNOOZE_DAYS * 86400000;
+  } catch { return false; }
+}
+
+function maybeShowInstall() {
+  if (isStandalone || !signedIn || installSnoozed()) return;
+  const sub = $('installSub');
+  if (installEvent) {
+    sub.textContent = 'Open it from your home screen, fullscreen like a normal app.';
+    $('installBtn').hidden = false;
+  } else if (isIOS) {
+    sub.innerHTML = 'Tap <span class="icon">ios_share</span> <b>Share</b>, then <b>Add to Home Screen</b>.';
+    $('installBtn').hidden = true;
+  } else {
+    return;
+  }
+  $('installBanner').hidden = false;
+}
+
+function hideInstall(snooze) {
+  $('installBanner').hidden = true;
+  if (snooze) try { localStorage.setItem('installDismissed', String(Date.now())); } catch {}
+}
+
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault(); // suppress Chrome's own mini-infobar, we show ours
+  installEvent = e;
+  maybeShowInstall();
+});
+window.addEventListener('appinstalled', () => {
+  installEvent = null;
+  hideInstall(false);
+  toast('Installed – you can open it from your home screen');
+});
+$('installBtn').onclick = async () => {
+  if (!installEvent) return;
+  const e = installEvent;
+  installEvent = null;
+  hideInstall(false);
+  e.prompt();
+  const { outcome } = await e.userChoice.catch(() => ({}));
+  if (outcome === 'dismissed') hideInstall(true);
+};
+$('installClose').onclick = () => hideInstall(true);
+
 // ------------------------------------------------------------------- init
 
 async function start() {
@@ -1031,6 +1092,7 @@ async function start() {
   signedIn = true;
   $('login').hidden = true;
   $('app').hidden = false;
+  setTimeout(maybeShowInstall, 4000); // don't greet people with a popup instantly
 
   const cams = Object.entries(cfg.cameras || {})
     .filter(([, c]) => c.enabled !== false)
