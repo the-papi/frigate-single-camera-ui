@@ -252,40 +252,215 @@ function setMode(mode) {
   const live = mode === 'live';
   $('mode').innerHTML = `<span class="dot"></span>${live ? 'LIVE' : 'RECORDING'}`;
   $('mode').className = 'badge ' + (live ? 'live' : 'rec');
-  liveImg.hidden = !live;
   video.hidden = live;
   $('golive').hidden = live;
   $('speedWrap').hidden = live;
-  // iPhones can only fullscreen <video>, not the live snapshot
-  $('fullscreen').hidden = !(document.fullscreenEnabled || (!live && video.webkitEnterFullscreen));
+  $('streamWrap').hidden = !live || liveStreams.length < 2;
+  updateFullscreenBtn();
   if (live) {
     video.pause();
     $('spinner').hidden = true;
     startLive();
+  } else {
+    stopLive();
+    liveImg.hidden = true;
+    liveVideo.hidden = true;
   }
   updatePlayBtn();
 }
 
-let liveTimer = null;
-let liveToken = 0;
-function stopLive() { liveToken++; clearTimeout(liveTimer); }
+function updateFullscreenBtn() {
+  // iPhones can only fullscreen a <video> element, not the snapshot image
+  const el = state.mode === 'live' ? (liveVideo.hidden ? null : liveVideo) : video;
+  $('fullscreen').hidden = !(document.fullscreenEnabled || (el && el.webkitEnterFullscreen));
+}
+
+// ---- live view
+//
+// Real video comes from go2rtc (bundled with Frigate) as fragmented MP4 over a
+// WebSocket, fed into Media Source Extensions – the same way Frigate's own UI
+// does it. Until the video plays (or if it can't: no MSE on older iPhones,
+// unsupported codec, stream missing) we show snapshots from the detect stream.
+
+const liveVideo = $('liveVideo');
+const MSE_CODECS = ['avc1.640029', 'avc1.64002A', 'avc1.640033', 'hvc1.1.6.L153.B0',
+                    'mp4a.40.2', 'mp4a.40.5', 'flac', 'opus'];
+let liveStreams = [];             // [{label, name}] go2rtc streams for the current camera
+const liveBroken = new Set();     // streams that failed to play: use snapshots for them
+let liveToken = 0, snapTimer = null, liveRetry = null, liveConn = null;
+
+function findLiveStreams(cfg, cam) {
+  const c = cfg.cameras?.[cam] || {};
+  const out = [];
+  const add = (label, name) => { if (name && !out.some((s) => s.name === name)) out.push({ label, name }); };
+  const ls = c.live?.streams;
+  if (ls && typeof ls === 'object' && !Array.isArray(ls)) for (const [label, name] of Object.entries(ls)) add(label, name);
+  if (c.live?.stream_name) add(c.live.stream_name, c.live.stream_name);
+  // go2rtc streams named after the camera (e.g. "cam" and "cam_sub")
+  const g = Object.keys(cfg.go2rtc?.streams || {}).filter((n) => n === cam || n.startsWith(cam + '_'));
+  g.sort((a, b) => (a === cam ? -1 : b === cam ? 1 : a.localeCompare(b)));
+  for (const n of g) add(n === cam ? 'Main' : n.slice(cam.length + 1), n);
+  if (!out.length) add(cam, cam);
+  return out;
+}
+
+function currentStream() {
+  return liveStreams.find((s) => s.name === $('stream').value) || liveStreams[0];
+}
+
+function stopLive() {
+  liveToken++;
+  clearTimeout(snapTimer);
+  clearTimeout(liveRetry);
+  if (liveConn) { try { liveConn.ws.close(); } catch {} liveConn = null; }
+  liveVideo.pause();
+  liveVideo.removeAttribute('src');
+  liveVideo.srcObject = null;
+  liveVideo.load();
+}
+
 function startLive() {
-  clearTimeout(liveTimer);
-  const token = ++liveToken;
+  stopLive();
+  const token = liveToken;
+  liveVideo.hidden = true;
+  liveImg.hidden = false;
+  startSnapshots(token);
+  const stream = currentStream();
+  const MS = window.ManagedMediaSource || window.MediaSource;
+  if (stream && MS && !liveBroken.has(stream.name)) connectLiveVideo(token, stream.name, MS);
+}
+
+function startSnapshots(token) {
   const tick = () => {
-    if (state.mode !== 'live' || token !== liveToken || !state.camera) return;
-    if (document.hidden) { liveTimer = setTimeout(tick, 1000); return; }
+    if (state.mode !== 'live' || token !== liveToken || !state.camera || liveImg.hidden) return;
+    if (document.hidden) { snapTimer = setTimeout(tick, 1000); return; }
     const img = new Image();
     img.onload = () => {
-      if (token !== liveToken) return;
+      if (token !== liveToken || liveImg.hidden) return;
       liveImg.src = img.src;
-      liveTimer = setTimeout(tick, 500);
+      snapTimer = setTimeout(tick, 500);
     };
-    img.onerror = () => { liveTimer = setTimeout(tick, 3000); };
+    img.onerror = () => { snapTimer = setTimeout(tick, 3000); };
     img.src = `/api/${encodeURIComponent(state.camera)}/latest.jpg?h=720&height=720&_=${Date.now()}`;
   };
   tick();
 }
+
+function connectLiveVideo(token, streamName, MS) {
+  const ms = new MS();
+  if (window.ManagedMediaSource && MS === window.ManagedMediaSource) {
+    liveVideo.disableRemotePlayback = true; // required for ManagedMediaSource (iOS 17.1+)
+    liveVideo.srcObject = ms;
+  } else {
+    liveVideo.src = URL.createObjectURL(ms);
+  }
+
+  ms.addEventListener('sourceopen', () => {
+    if (token !== liveToken) return;
+    if (!window.ManagedMediaSource) URL.revokeObjectURL(liveVideo.src);
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const ws = new WebSocket(`${proto}://${location.host}/live/mse/api/ws?src=${encodeURIComponent(streamName)}`);
+    ws.binaryType = 'arraybuffer';
+    const conn = liveConn = { ws, played: false };
+    let sb = null;
+    let queue = [];
+
+    const pump = () => {
+      if (!sb || sb.updating || token !== liveToken) return;
+      try {
+        if (queue.length) {
+          const data = queue.length === 1 ? queue[0] : concatBuffers(queue);
+          queue = [];
+          sb.appendBuffer(data);
+        } else if (sb.buffered.length) {
+          // keep memory bounded: drop everything but the last ~10 s
+          const start = sb.buffered.start(0), end = sb.buffered.end(sb.buffered.length - 1);
+          if (end - start > 30) sb.remove(start, end - 10);
+        }
+      } catch { /* e.g. quota exceeded – the next updateend retries */ }
+      // stay at the live edge (the browser drifts behind after stalls / backgrounding)
+      if (sb.buffered.length) {
+        const end = sb.buffered.end(sb.buffered.length - 1);
+        if (end - liveVideo.currentTime > 3) liveVideo.currentTime = end - 0.5;
+      }
+    };
+
+    ws.onopen = () => {
+      const codecs = MSE_CODECS.filter((c) => MS.isTypeSupported(`video/mp4; codecs="${c}"`)).join();
+      ws.send(JSON.stringify({ type: 'mse', value: codecs }));
+    };
+    ws.onmessage = (ev) => {
+      if (token !== liveToken) return;
+      if (typeof ev.data === 'string') {
+        let msg = {};
+        try { msg = JSON.parse(ev.data); } catch {}
+        if (msg.type === 'mse') {
+          try {
+            sb = ms.addSourceBuffer(msg.value);
+            sb.mode = 'segments';
+            sb.addEventListener('updateend', pump);
+          } catch (e) {
+            liveFailed(token, conn, streamName, `unsupported codec (${msg.value})`);
+          }
+        } else if (msg.type === 'error') {
+          liveFailed(token, conn, streamName, msg.value);
+        }
+        return;
+      }
+      queue.push(ev.data);
+      pump();
+    };
+    ws.onclose = (ev) => {
+      if (token !== liveToken) return;
+      if (ev.code === 4401) { api('/api/config').catch(() => {}); return; } // triggers the login screen
+      liveFailed(token, conn, streamName, 'connection closed');
+    };
+  }, { once: true });
+
+  liveVideo.oncanplay = () => liveVideo.play().catch(() => {});
+  liveVideo.onplaying = () => {
+    if (token !== liveToken) return;
+    if (liveConn) liveConn.played = true;
+    liveVideo.hidden = false;
+    liveImg.hidden = true;  // also stops the snapshot loop
+    clearTimeout(snapTimer);
+    updateFullscreenBtn();
+  };
+}
+
+function concatBuffers(chunks) {
+  let n = 0;
+  for (const c of chunks) n += c.byteLength;
+  const out = new Uint8Array(n);
+  let o = 0;
+  for (const c of chunks) { out.set(new Uint8Array(c), o); o += c.byteLength; }
+  return out;
+}
+
+function liveFailed(token, conn, streamName, reason) {
+  if (token !== liveToken) return;
+  const wasPlaying = conn?.played;
+  stopLive(); // invalidates token
+  const t = liveToken;
+  liveVideo.hidden = true;
+  liveImg.hidden = false;
+  startSnapshots(t);
+  updateFullscreenBtn();
+  if (wasPlaying) {
+    // dropped after it worked (network hiccup, Frigate restart): reconnect shortly
+    liveRetry = setTimeout(() => { if (state.mode === 'live' && t === liveToken && !document.hidden) startLive(); }, 3000);
+  } else {
+    liveBroken.add(streamName);
+    console.warn('Live video unavailable, using snapshots:', reason);
+    toast('Live video unavailable – showing snapshots instead');
+  }
+}
+
+$('stream').onchange = () => {
+  try { localStorage.setItem(`stream:${state.camera}`, $('stream').value); } catch {}
+  liveBroken.delete($('stream').value); // give a manually picked stream another chance
+  if (state.mode === 'live') startLive();
+};
 
 function goLive() {
   if (hls) { hls.destroy(); hls = null; }
@@ -920,7 +1095,10 @@ $('speed').onchange = (e) => {
 $('fullscreen').onclick = () => {
   if (document.fullscreenElement) document.exitFullscreen();
   else if (document.fullscreenEnabled) $('player').requestFullscreen().catch(() => {});
-  else if (state.mode === 'playback' && video.webkitEnterFullscreen) video.webkitEnterFullscreen(); // iPhone
+  else {
+    const el = state.mode === 'live' ? liveVideo : video; // iPhone: only <video> can go fullscreen
+    if (!el.hidden && el.webkitEnterFullscreen) el.webkitEnterFullscreen();
+  }
 };
 document.addEventListener('fullscreenchange', () => {
   $('fullscreen').firstElementChild.textContent = document.fullscreenElement ? 'fullscreen_exit' : 'fullscreen';
@@ -950,6 +1128,13 @@ $('camera').onchange = (e) => selectCamera(e.target.value);
 
 function selectCamera(cam) {
   state.camera = cam;
+  liveStreams = frigateConfig ? findLiveStreams(frigateConfig, cam) : [{ label: cam, name: cam }];
+  const sel = $('stream');
+  sel.innerHTML = '';
+  for (const s of liveStreams) sel.add(new Option(s.label, s.name));
+  let savedStream = null;
+  try { savedStream = localStorage.getItem(`stream:${cam}`); } catch {}
+  if (liveStreams.some((s) => s.name === savedStream)) sel.value = savedStream;
   thresholdDirty = true;
   try { localStorage.setItem('camera', cam); } catch {}
   cancelRecording();
@@ -1081,6 +1266,8 @@ $('installClose').onclick = () => hideInstall(true);
 
 // ------------------------------------------------------------------- init
 
+let frigateConfig = null;
+
 async function start() {
   let cfg, ui = {};
   try {
@@ -1090,6 +1277,7 @@ async function start() {
     return;
   }
   signedIn = true;
+  frigateConfig = cfg;
   $('login').hidden = true;
   $('app').hidden = false;
   setTimeout(maybeShowInstall, 4000); // don't greet people with a popup instantly
@@ -1116,7 +1304,14 @@ requestAnimationFrame(frame);
 setInterval(() => { dirty = true; ensureViewData(); }, 15000);
 // coming back to the installed app after a while: refresh live + timeline right away
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden && signedIn) { dirty = true; ensureViewData(); }
+  if (!signedIn) return;
+  if (document.hidden) {
+    if (state.mode === 'live') stopLive(); // don't stream video in the background
+  } else {
+    dirty = true;
+    ensureViewData();
+    if (state.mode === 'live') startLive();
+  }
 });
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
 start();

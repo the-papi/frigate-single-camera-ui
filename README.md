@@ -3,7 +3,8 @@
 A small, phone-friendly web app (installable PWA, Material Design 3) for watching a
 [Frigate](https://frigate.video) camera. It was built for watching a pet, and is meant to be simpler than the full Frigate UI.
 
-- **Video**: live view and recorded playback (Frigate VOD / HLS), 1–16× speed, fullscreen
+- **Video**: live video (go2rtc, same as Frigate's own live view) with a stream / quality picker,
+  recorded playback (Frigate VOD / HLS), 1–16× speed, fullscreen
 - **Timeline**: drag to pan, pinch / scroll to zoom (1 min – 3 days), tap to play from there.
   Shaded = recording exists, orange bars = **motion** (Frigate's motion detection, not objects).
   Faded bars are minor motion.
@@ -63,7 +64,8 @@ prompt for websites). It is hidden inside the installed app and after closing it
 
 `app/main.py` is a small FastAPI proxy. Signing in posts the credentials to Frigate's
 `/api/login`. The resulting Frigate session token (JWT) is kept in an httpOnly cookie in the
-browser, and the proxy attaches it to every `/api/*` and `/vod/*` request it forwards to Frigate.
+browser, and the proxy attaches it to every `/api/*` and `/vod/*` request (and the `/live/` WebSocket)
+it forwards to Frigate.
 The server keeps no credentials or state. When Frigate rejects the token, the login
 screen is shown again.
 
@@ -76,8 +78,21 @@ Roboto and Material Symbols from CDNs. `sw.js` caches the app shell but never ca
 | cameras | `GET /api/config` |
 | motion + recording coverage | `GET /api/<camera>/recordings?after=&before=` |
 | playback | `GET /vod/<camera>/start/<ts>/end/<ts>/index.m3u8` |
-| live | `GET /api/<camera>/latest.jpg` |
+| live video | WebSocket `/live/mse/api/ws?src=<go2rtc stream>` (MSE) |
+| live fallback | `GET /api/<camera>/latest.jpg` (snapshots from the detect stream) |
 | clips | `GET /api/<camera>/start/<ts>/end/<ts>/clip.mp4` |
+
+### Live view and stream quality
+
+Live video is streamed from go2rtc through Frigate's `/live/` endpoint, like Frigate's own UI.
+The picker on the video lists the camera's streams: the ones in `cameras.<name>.live.streams`
+(Frigate 0.15+) or `live.stream_name`, plus go2rtc streams named after the camera (`<camera>`
+→ "Main", `<camera>_sub` → "sub"). The last choice is remembered per camera.
+
+If live video can't play (older iPhones without MSE / ManagedMediaSource, a codec the browser
+can't decode such as H.265 in most browsers, or the stream missing in go2rtc), the app falls back
+to snapshots from Frigate's `detect` stream, which are lower quality and ~2 fps.
+The stream is paused while the app is in the background.
 
 ### Motion skipping
 

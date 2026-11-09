@@ -3,25 +3,31 @@
 The browser only ever talks to this app. Users sign in with their own Frigate
 credentials on the login screen; we exchange them for a Frigate session token
 (JWT) and keep it in an httpOnly cookie on *our* origin. Every proxied request
-to /api and /vod gets that token attached as Frigate's auth cookie.
+to /api and /vod (and the /live WebSocket used for live video) gets that token
+attached as Frigate's auth cookie.
 No credentials are stored server-side.
 """
 
+import asyncio
 import html
 import http.cookiejar
 import logging
 import os
+import ssl
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
+from websockets.asyncio.client import connect as ws_connect
+from websockets.exceptions import InvalidStatus
 
 FRIGATE_URL = os.environ.get("FRIGATE_URL", "").rstrip("/")
 if not FRIGATE_URL:
     raise SystemExit("FRIGATE_URL is not set – copy .env.example to .env and fill it in")
+FRIGATE_WS_URL = "wss://" + FRIGATE_URL[8:] if FRIGATE_URL.startswith("https://") else "ws://" + FRIGATE_URL.split("://", 1)[-1]
 APP_NAME = os.environ.get("APP_NAME", "").strip() or "Frigate Cam"
 APP_SHORT_NAME = os.environ.get("APP_SHORT_NAME", "").strip() or APP_NAME
 DEFAULT_CAMERA = os.environ.get("DEFAULT_CAMERA", "")
@@ -167,6 +173,69 @@ async def manifest():
         },
         media_type="application/manifest+json",
     )
+
+
+# ------------------------------------------------------------ live (go2rtc)
+
+@app.websocket("/live/{path:path}")
+async def live_ws(websocket: WebSocket, path: str):
+    """Relay the go2rtc WebSocket (MSE live video) through Frigate's /live/ endpoint."""
+    await websocket.accept()  # accept first so we can report errors with close codes
+    token = websocket.cookies.get(TOKEN_COOKIE)
+    name = websocket.cookies.get(NAME_COOKIE) or "frigate_token"
+    if not token:
+        await websocket.close(code=4401)
+        return
+
+    url = f"{FRIGATE_WS_URL}/live/{path}"
+    if websocket.url.query:
+        url += "?" + websocket.url.query
+    ssl_ctx = None
+    if url.startswith("wss://"):
+        ssl_ctx = ssl.create_default_context()
+        if not VERIFY_TLS:
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = ssl.CERT_NONE
+
+    try:
+        upstream = await ws_connect(url, additional_headers={"Cookie": f"{name}={token}"}, ssl=ssl_ctx,
+                                    max_size=None, open_timeout=10, ping_interval=20)
+    except InvalidStatus as e:
+        await websocket.close(code=4401 if e.response.status_code == 401 else 4502)
+        return
+    except Exception as e:  # noqa: BLE001 – network errors of all kinds
+        log.warning("Live stream connection failed: %s", e)
+        await websocket.close(code=4502)
+        return
+
+    async def to_upstream():
+        while True:
+            msg = await websocket.receive()
+            if msg["type"] == "websocket.disconnect":
+                return
+            if msg.get("text") is not None:
+                await upstream.send(msg["text"])
+            elif msg.get("bytes") is not None:
+                await upstream.send(msg["bytes"])
+
+    async def to_client():
+        async for msg in upstream:
+            if isinstance(msg, bytes):
+                await websocket.send_bytes(msg)
+            else:
+                await websocket.send_text(msg)
+
+    tasks = [asyncio.create_task(to_upstream()), asyncio.create_task(to_client())]
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    for t in pending:
+        t.cancel()
+    for t in done:
+        t.exception()  # retrieve so it isn't logged as "never retrieved"
+    await upstream.close()
+    try:
+        await websocket.close()
+    except RuntimeError:
+        pass  # already closed by the browser
 
 
 # ---------------------------------------------------------------------- proxy

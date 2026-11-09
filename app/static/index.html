@@ -58,6 +58,7 @@
       <div class="player" id="player">
         <video id="video" playsinline muted></video>
         <img id="live" alt="Live view">
+        <video id="liveVideo" playsinline muted autoplay hidden></video>
         <div id="spinner" class="spinner" hidden></div>
         <div class="overlay top">
           <span id="mode" class="badge live"><span class="dot"></span>LIVE</span>
@@ -69,6 +70,10 @@
         <div class="overlay bottom">
           <span id="clock" class="time-chip"></span>
           <span class="grow"></span>
+          <label class="video-chip" id="streamWrap" title="Live stream quality" hidden>
+            <span class="icon small">hd</span>
+            <select id="stream" aria-label="Live stream"></select>
+          </label>
           <label class="video-chip" id="speedWrap" title="Playback speed">
             <span class="icon small">speed</span>
             <select id="speed" aria-label="Playback speed">
