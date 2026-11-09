@@ -1,0 +1,30 @@
+# Example for running behind Traefik. Copy it and adjust the marked values:
+#
+#   cp docker-compose.traefik.example.yaml docker-compose.traefik.yaml
+#   docker compose -f docker-compose.traefik.yaml up -d --build
+#
+# docker-compose.traefik.yaml is gitignored, so your hostnames stay local.
+# Assumes Traefik runs on the external docker network "web" with an entrypoint
+# named "https" (TLS handled by Traefik). HTTPS is required to install the PWA.
+
+services:
+    frigate-ui:
+        restart: unless-stopped
+        build:
+            context: .
+        env_file:
+            - .env
+        networks:
+            - web
+        labels:
+            traefik.enable: true
+            traefik.docker.network: web
+            # change "frigate-ui" (router/service name) and the hostname
+            traefik.http.routers.frigate-ui.rule: Host(`cam.example.com`)
+            traefik.http.routers.frigate-ui.entryPoints: https
+            traefik.http.routers.frigate-ui.service: frigate-ui
+            traefik.http.services.frigate-ui.loadbalancer.server.port: 8000
+
+networks:
+    web:
+        external: true

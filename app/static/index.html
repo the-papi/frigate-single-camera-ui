@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#19120c" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#fff8f5" media="(prefers-color-scheme: light)">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="{{APP_SHORT_NAME}}">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>{{APP_NAME}}</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" type="image/png" href="/static/icons/favicon.png">
+  <link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,400,0..1,0&display=block">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
+</head>
+<body>
+  <!-- ============================================================ login -->
+  <div id="login" class="login" hidden>
+    <form id="loginForm" class="login-card" autocomplete="on">
+      <img src="/static/icons/icon-192.png" alt="" class="login-logo">
+      <h1>{{APP_NAME}}</h1>
+      <p class="login-sub">Sign in with your Frigate account</p>
+      <label class="text-field">
+        <span class="field-label">Username</span>
+        <input id="loginUser" name="username" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" required>
+      </label>
+      <label class="text-field">
+        <span class="field-label">Password</span>
+        <input id="loginPass" name="password" type="password" autocomplete="current-password" required>
+      </label>
+      <p id="loginError" class="login-error" hidden></p>
+      <button class="btn filled wide" id="loginBtn" type="submit">Sign in</button>
+    </form>
+  </div>
+
+  <!-- ============================================================== app -->
+  <div id="app" hidden>
+    <header class="top-app-bar">
+      <img src="/static/icons/icon-192.png" alt="" class="logo">
+      <h1>{{APP_NAME}}</h1>
+      <span class="grow"></span>
+      <label class="select-chip" id="cameraWrap" hidden>
+        <span class="icon small">videocam</span>
+        <select id="camera" aria-label="Camera"></select>
+        <span class="icon small">arrow_drop_down</span>
+      </label>
+      <button class="icon-btn" id="logout" aria-label="Sign out" title="Sign out"><span class="icon">logout</span></button>
+    </header>
+
+    <main class="layout">
+      <div class="player" id="player">
+        <video id="video" playsinline muted></video>
+        <img id="live" alt="Live view">
+        <div id="spinner" class="spinner" hidden></div>
+        <div class="overlay top">
+          <span id="mode" class="badge live"><span class="dot"></span>LIVE</span>
+          <button class="video-chip" id="golive" title="Back to live (L)"><span class="icon small">sensors</span>Go live</button>
+          <span class="grow"></span>
+          <span id="recBadge" class="rec-badge" hidden><span class="dot"></span>REC <span id="recTime">0:00</span></span>
+          <button class="icon-btn on-video" id="fullscreen" aria-label="Fullscreen"><span class="icon">fullscreen</span></button>
+        </div>
+        <div class="overlay bottom">
+          <span id="clock" class="time-chip"></span>
+          <span class="grow"></span>
+          <label class="video-chip" id="speedWrap" title="Playback speed">
+            <span class="icon small">speed</span>
+            <select id="speed" aria-label="Playback speed">
+              <option value="1">1×</option>
+              <option value="2">2×</option>
+              <option value="4">4×</option>
+              <option value="8">8×</option>
+              <option value="16">16×</option>
+            </select>
+          </label>
+        </div>
+      </div>
+
+      <div class="transport">
+        <button class="icon-btn" id="prevMotion" aria-label="Previous motion" title="Previous motion (P)"><span class="icon">skip_previous</span></button>
+        <button class="icon-btn" id="back" aria-label="Back 10 seconds" title="Back 10 s (←)"><span class="icon">replay_10</span></button>
+        <button class="fab" id="play" aria-label="Play or pause" title="Play / pause (Space)"><span class="icon filled">play_arrow</span></button>
+        <button class="icon-btn" id="fwd" aria-label="Forward 10 seconds" title="Forward 10 s (→)"><span class="icon">forward_10</span></button>
+        <button class="icon-btn" id="nextMotion" aria-label="Next motion" title="Next motion (N)"><span class="icon">skip_next</span></button>
+        <span class="divider"></span>
+        <button class="btn rec-btn" id="recBtn" aria-pressed="false" title="Record a clip (R)"><span class="icon small filled">fiber_manual_record</span><span class="lbl">Record</span></button>
+      </div>
+
+      <div class="card timeline-card">
+        <div class="timeline-head">
+          <span class="legend"><i class="sw rec"></i>Recording</span>
+          <span class="legend"><i class="sw motion"></i>Motion</span>
+          <span class="legend"><i class="sw motion faint"></i>Minor</span>
+          <span class="grow"></span>
+          <button class="icon-btn small" id="zoomOut" aria-label="Zoom out" title="Zoom out (-)"><span class="icon">zoom_out</span></button>
+          <button class="icon-btn small" id="zoomIn" aria-label="Zoom in" title="Zoom in (+)"><span class="icon">zoom_in</span></button>
+        </div>
+        <canvas id="timeline"></canvas>
+        <p class="hint mouse">Drag to pan · scroll to zoom · click to play</p>
+        <p class="hint touch">Drag to pan · pinch to zoom · tap to play</p>
+      </div>
+
+    </main>
+  </div>
+
+  <!-- ======================================= finished clip (bottom sheet) -->
+  <div id="sheet" class="sheet-scrim" hidden>
+    <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="sheetTitle">
+      <div class="sheet-handle"></div>
+      <h2 id="sheetTitle">Your clip</h2>
+      <p id="sheetInfo" class="sheet-info"></p>
+      <div id="sheetStatus" class="sheet-status">
+        <div class="status-row"><span class="mini-spinner"></span><span id="sheetStatusText">Preparing…</span></div>
+        <div class="progress indeterminate" id="sheetProgress"><div class="bar"></div></div>
+      </div>
+      <video id="sheetVideo" playsinline controls muted hidden></video>
+      <div class="sheet-actions">
+        <button class="btn filled wide" id="sheetShare" hidden><span class="icon small">ios_share</span>Save or share</button>
+        <a class="btn tonal wide" id="sheetDownload" hidden><span class="icon small">download</span>Download</a>
+        <button class="btn text wide" id="sheetClose">Discard</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="snackbar" hidden></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
