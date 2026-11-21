@@ -636,7 +636,7 @@ function loadAndSeek(cam, hour, segs, t, autoplay) {
   }
 
   state.win = { camera: cam, start: hour, segs };
-  const startPos = wallToVideo(t);
+  const startPos = state.win.startPos = wallToVideo(t);
   showPreview(t);
   // master.m3u8 (like Frigate's own UI) announces codecs + bitrate, which Apple's player wants up front
   const url = `/vod/${encodeURIComponent(cam)}/start/${hour}/end/${hour + HOUR}/master.m3u8`;
@@ -715,7 +715,14 @@ function updatePlayBtn() {
 }
 
 video.addEventListener('timeupdate', () => {
-  if (state.mode !== 'playback' || !state.win || scrub) return;
+  const w = state.win;
+  if (state.mode !== 'playback' || !w || scrub) return;
+  if (!w.ready) {
+    // A freshly loaded hour reports position 0 (= the top of the hour) until the
+    // initial seek lands – don't let the playhead flash back there meanwhile.
+    if (Math.abs(video.currentTime - w.startPos) > 1.5) return;
+    w.ready = true;
+  }
   state.cur = videoToWall(video.currentTime);
   if (state.previewEnd && state.cur >= state.previewEnd) {
     video.pause();
@@ -723,7 +730,12 @@ video.addEventListener('timeupdate', () => {
   }
 });
 video.addEventListener('playing', () => { $('spinner').hidden = true; hidePreview(); updatePlayBtn(); });
-video.addEventListener('seeked', () => { if (!scrub || isBuffered(video.currentTime)) hidePreview(); });
+video.addEventListener('seeked', () => {
+  const w = state.win;
+  // the initial seek landed (or was clamped to the end because the target is past the video)
+  if (w && (Math.abs(video.currentTime - w.startPos) <= 1.5 || video.currentTime >= video.duration - 1)) w.ready = true;
+  if (!scrub || isBuffered(video.currentTime)) hidePreview();
+});
 video.addEventListener('pause', updatePlayBtn);
 video.addEventListener('play', updatePlayBtn);
 video.addEventListener('waiting', () => { $('spinner').hidden = false; });
