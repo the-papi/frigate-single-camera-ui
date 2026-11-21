@@ -7,7 +7,8 @@ A small, phone-friendly web app (installable PWA, Material Design 3) for watchin
   recorded playback (Frigate VOD / HLS), 1–16× speed, fullscreen.
   Double-tap the left / right side of the video to skip ∓10 s (keep tapping for more);
   pinch / scroll wheel zooms into the picture (up to 8×), drag to look around while zoomed
-- **Timeline**: the playhead stays in the middle; drag the timeline to scrub through the video,
+- **Timeline**: the playhead stays in the middle; drag the timeline to scrub through the video
+  (when the drag rests for a moment, that spot is loaded in the background so letting go plays instantly),
   pinch / scroll to zoom (1 min – 3 days), tap to play from there.
   Shaded = recording exists, orange bars = **motion** (Frigate's motion detection, not objects).
   Faded bars are minor motion.

@@ -249,6 +249,15 @@ function wallToVideo(t) {
   return v;
 }
 
+function videoToWallIn(segs, v) {
+  for (const s of segs) {
+    const d = s.e - s.s;
+    if (v <= d) return s.s + v;
+    v -= d;
+  }
+  return segs.length ? segs[segs.length - 1].e : 0;
+}
+
 function videoToWall(v) {
   const segs = state.win.segs;
   for (const s of segs) {
@@ -541,12 +550,13 @@ function goLive() {
  * if t falls into a gap). dir < 0 means "searching backwards".
  */
 let playSeq = 0; // a newer seek / drag cancels a playAt() still waiting for recordings
-async function playAt(t, { autoplay = true, dir = 1, previewEnd = null } = {}) {
+async function playAt(t, { autoplay = true, dir = 1, previewEnd = null, prefetch = false } = {}) {
   const cam = state.camera;
   const seq = ++playSeq;
-  state.previewEnd = previewEnd;
+  if (!prefetch) state.previewEnd = previewEnd;
   for (let guard = 0; guard < 24 * 7; guard++) {
     if (t >= now() - 5) {
+      if (prefetch) return;
       if (state.mode === 'live') { state.cur = now(); hidePreview(); } else goLive();
       return;
     }
@@ -559,27 +569,30 @@ async function playAt(t, { autoplay = true, dir = 1, previewEnd = null } = {}) {
       if (signedIn) toast(`Failed to load recordings: ${e.message}`, true);
       return;
     }
-    if (cam !== state.camera || seq !== playSeq || scrub) return;
+    if (cam !== state.camera || seq !== playSeq || (scrub && !prefetch)) return;
 
     if (dir < 0) {
       // Last segment starting before t; if t is in a gap after it, jump near its end.
       const prev = [...segs].reverse().find((s) => s.s <= t);
       if (prev) {
         if (t > prev.e) t = Math.max(prev.s, prev.e - 10);
-        return loadAndSeek(cam, hour, segs, t, autoplay);
+        return loadAndSeek(cam, hour, segs, t, autoplay, prefetch);
       }
       t = hour - 0.001; // try previous hour
       continue;
     }
 
     const seg = segs.find((s) => s.e > t + 0.05);
-    if (seg) return loadAndSeek(cam, hour, segs, Math.max(t, seg.s), autoplay);
+    if (seg) return loadAndSeek(cam, hour, segs, Math.max(t, seg.s), autoplay, prefetch);
     t = hour + HOUR; // nothing left in this hour, try the next one
   }
   toast('No recordings found there', true);
 }
 
 let nativeHlsFailed = false;
+// iPhones (ManagedMediaSource) get small buffers like in Frigate's UI, they evict aggressively
+const HLS_BUFFER = isIOS ? { length: 10, size: 20e6 } : { length: 30, size: 60e6 };
+const PREFETCH_BUFFER = 4; // seconds: a prefetch loads just the segment at the target
 // ---- preview frame
 //
 // Loading recorded video can take a moment (especially on iPhones), so show a
@@ -587,7 +600,8 @@ let nativeHlsFailed = false;
 // and while scrubbing outside the loaded hour. Hidden once the video has the frame.
 
 const preview = $('preview');
-let previewOn = false, previewWant = null, previewBusy = false;
+let previewOn = false, previewWant = null, previewBusy = false, previewAt = 0;
+const PREVIEW_GAP = 250; // ms between preview requests (each one makes Frigate run ffmpeg)
 
 function showPreview(t) {
   previewOn = true;
@@ -596,9 +610,16 @@ function showPreview(t) {
 }
 
 function loadPreview() {
+  if (previewWant == null || !state.camera) return;
+  const wait = previewAt + PREVIEW_GAP - performance.now();
+  if (wait > 0) {
+    previewBusy = true;
+    setTimeout(() => { previewBusy = false; loadPreview(); }, wait);
+    return;
+  }
   const t = previewWant;
   previewWant = null;
-  if (t == null || !state.camera) return;
+  previewAt = performance.now();
   previewBusy = true;
   const img = new Image();
   const done = (ok) => {
@@ -623,31 +644,52 @@ const isBuffered = (v) => {
   return false;
 };
 
-function loadAndSeek(cam, hour, segs, t, autoplay) {
-  setMode('playback');
-  state.cur = t;
-  const same = state.win && state.win.camera === cam && state.win.start === hour &&
-               state.win.segs.length === segs.length;
+/**
+ * Show recorded video at wall time t, loading its hour if needed. With
+ * `prefetch` (while the timeline is being dragged) only the loading happens –
+ * in the background, without switching modes – so letting go starts quickly.
+ */
+function loadAndSeek(cam, hour, segs, t, autoplay, prefetch = false) {
+  if (!prefetch) {
+    setMode('playback');
+    state.cur = t;
+    if (hls) hls.config.maxBufferLength = HLS_BUFFER.length; // a prefetched hour now really plays
+  }
+  const w = state.win;
+  const same = w && w.camera === cam && w.start === hour && w.segs.length === segs.length;
   if (same) {
-    if (!isBuffered(wallToVideo(t))) showPreview(t);
-    video.currentTime = wallToVideo(t);
-    if (autoplay) video.play().catch(() => {});
+    const pos = wallToVideo(t);
+    if (!w.loaded) {
+      // still loading (e.g. prefetched while dragging): just retarget where it starts
+      w.startPos = pos;
+      w.ready = false;
+      if (!prefetch) { w.autoplay = autoplay; showPreview(t); $('spinner').hidden = false; }
+      return;
+    }
+    if (!prefetch && !isBuffered(pos)) showPreview(t);
+    video.currentTime = pos; // reported right away once loaded
+    w.startPos = pos;
+    w.ready = true;
+    if (autoplay && !prefetch) video.play().catch(() => {});
     return;
   }
 
-  state.win = { camera: cam, start: hour, segs };
+  state.win = { camera: cam, start: hour, segs, autoplay: autoplay && !prefetch, loaded: false, ready: false };
   const startPos = state.win.startPos = wallToVideo(t);
-  showPreview(t);
+  if (!prefetch) showPreview(t);
   // master.m3u8 (like Frigate's own UI) announces codecs + bitrate, which Apple's player wants up front
   const url = `/vod/${encodeURIComponent(cam)}/start/${hour}/end/${hour + HOUR}/master.m3u8`;
-  dbg(`load ${new Date(hour * 1000).toLocaleTimeString()} +${Math.round(startPos)}s`);
-  $('spinner').hidden = false;
+  dbg(`${prefetch ? 'prefetch' : 'load'} ${new Date(hour * 1000).toLocaleTimeString()} +${Math.round(startPos)}s`);
+  if (!prefetch) $('spinner').hidden = false;
 
   if (hls) { hls.destroy(); hls = null; }
+  const win = state.win;
   const onReady = () => {
-    video.currentTime = startPos;
+    if (state.win !== win) return;
+    win.loaded = true;
+    video.currentTime = win.startPos; // may have been retargeted while loading
     video.playbackRate = state.rate;
-    if (autoplay) video.play().catch(() => {});
+    if (win.autoplay) video.play().catch(() => {});
   };
 
   // iPhone / iPad: Safari's native HLS player starts faster and stalls less than
@@ -665,14 +707,16 @@ function loadAndSeek(cam, hour, segs, t, autoplay) {
       dbg(`native error ${video.error?.code}: ${video.error?.message || ''}`);
       if (!hlsOk || forcedPlayer) { toast('Playback error', true); $('spinner').hidden = true; return; }
       nativeHlsFailed = true; // fall back to hls.js from now on
+      const resume = win.autoplay || state.mode === 'playback';
       state.win = null;
-      loadAndSeek(cam, hour, segs, t, autoplay);
+      loadAndSeek(cam, hour, segs, videoToWallIn(segs, win.startPos), win.autoplay, !resume);
     };
   } else if (hlsOk) {
     video.onerror = null;
-    // iPhones (ManagedMediaSource) get small buffers like in Frigate's UI, they evict aggressively
-    hls = new Hls(isIOS ? { startPosition: startPos, maxBufferLength: 10, maxBufferSize: 20e6, enableWorker: true }
-                        : { startPosition: startPos, maxBufferLength: 30, enableWorker: true });
+    hls = new Hls({
+      startPosition: startPos, enableWorker: true, maxBufferSize: HLS_BUFFER.size,
+      maxBufferLength: prefetch ? PREFETCH_BUFFER : HLS_BUFFER.length,
+    });
     if (DEBUG) {
       hls.on(Hls.Events.MANIFEST_PARSED, (_e, d) => dbg(`manifest: ${d.levels.length} level(s) ${d.levels[0]?.codecSet || ''}`));
       hls.on(Hls.Events.FRAG_LOADED, (_e, d) => dbg(`frag ${d.frag.sn} ${Math.round(d.frag.stats.loading.end - d.frag.stats.loading.start)} ms`));
@@ -734,11 +778,11 @@ video.addEventListener('seeked', () => {
   const w = state.win;
   // the initial seek landed (or was clamped to the end because the target is past the video)
   if (w && (Math.abs(video.currentTime - w.startPos) <= 1.5 || video.currentTime >= video.duration - 1)) w.ready = true;
-  if (!scrub || isBuffered(video.currentTime)) hidePreview();
+  if (state.mode === 'playback' && (!scrub || isBuffered(video.currentTime))) hidePreview();
 });
 video.addEventListener('pause', updatePlayBtn);
 video.addEventListener('play', updatePlayBtn);
-video.addEventListener('waiting', () => { $('spinner').hidden = false; });
+video.addEventListener('waiting', () => { if (state.mode === 'playback') $('spinner').hidden = false; });
 video.addEventListener('canplay', () => { $('spinner').hidden = true; });
 video.addEventListener('ended', () => {
   if (state.mode !== 'playback' || !state.win) return;
@@ -948,7 +992,11 @@ function frame() {
 
 let drag = null;   // {x0, t0, moved}
 let pinch = null;  // {d0, span0}
-let scrub = null;  // {wasPlaying, seekAt} while the playhead is being dragged
+let scrub = null;  // {wasPlaying, seekAt, prefetchTimer} while the playhead is being dragged
+// Easy on the server (a Raspberry Pi is enough for Frigate): while dragging, only
+// video that's already buffered is shown; loading starts once the drag has rested
+// for PREFETCH_DWELL ms, and then only the segment at that spot.
+const PREFETCH_DWELL = 400;
 let hoverX = null;
 const pointers = new Map();
 
@@ -964,18 +1012,26 @@ function scrubTo(t) {
   dirty = true;
   const w = state.win;
   const at = performance.now();
-  const inWin = state.mode === 'playback' && w && w.camera === state.camera && floorHour(state.cur) === w.start;
-  if (inWin && at - scrub.seekAt > 150) {
+  const inWin = w && w.loaded && w.camera === state.camera && floorHour(state.cur) === w.start;
+  const buffered = inWin && isBuffered(wallToVideo(state.cur));
+  if (buffered && at - scrub.seekAt > 100) { // frames we already have: no network
     scrub.seekAt = at;
     const v = wallToVideo(state.cur);
     if (video.fastSeek) video.fastSeek(v); else video.currentTime = v;
   }
-  if (!inWin || !isBuffered(wallToVideo(state.cur))) showPreview(state.cur);
+  if (state.mode === 'live' || !buffered) showPreview(state.cur);
+  // Start loading the spot once the drag rests there (moves of a few px don't count).
+  if (scrub.dwellT == null || (Math.abs(state.cur - scrub.dwellT) / span()) * cssW > 4) {
+    scrub.dwellT = state.cur;
+    clearTimeout(scrub.prefetchTimer);
+    scrub.prefetchTimer = setTimeout(() => { if (scrub) playAt(state.cur, { prefetch: true }); }, PREFETCH_DWELL);
+  }
 }
 
 function scrubEnd() {
   const s = scrub;
   if (!s) return;
+  clearTimeout(s.prefetchTimer);
   scrub = null;
   playAt(state.cur, { autoplay: s.wasPlaying });
 }

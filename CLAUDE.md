@@ -68,7 +68,11 @@ There is no test suite; see "Verifying changes" below.
   newer seek cancel a `playAt` still waiting for recordings.
 - **Timeline**: the playhead is always in the middle (`state.view` is derived from `state.cur` +
   `state.span` in `syncView()`). Dragging scrubs (`scrubStart/To/End`: preview seeks inside the
-  loaded hour, `playAt` on release). It is a canvas: coverage + motion bars bucketed per 2 px, normalized to the
+  loaded hour, `playAt` on release). While dragging, only already-buffered video is seeked; once the
+  drag rests `PREFETCH_DWELL` ms, `playAt(t, {prefetch: true})` loads that spot in the background
+  (no mode switch, hls.js buffer capped at `PREFETCH_BUFFER` s = one segment) so release is
+  instant. Preview stills are capped at one request per `PREVIEW_GAP` ms. Keep this light: the
+  owner's Frigate runs on a Raspberry Pi. It is a canvas: coverage + motion bars bucketed per 2 px, normalized to the
   95th percentile. Colors come from CSS custom properties via `readColors()` (light/dark aware);
   don't hard-code colors in `draw()`.
 - **Significant motion** (⏮/⏭, faded "minor" bars): segment motion ≥ `SIG_FRACTION` × 90th
