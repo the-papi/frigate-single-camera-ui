@@ -415,7 +415,7 @@ a.btn { text-decoration: none; }
   #recBtn .lbl { display: none; }
   #recBtn .icon { margin: 0; }
   .timeline-card { background: none; padding: 0; margin: 0; }
-  .timeline-head, .timeline-card .hint { display: none !important; }
+  .timeline-head, .timeline-card .hints { display: none !important; }
   #timeline { height: var(--tl-h); }
 
   .overlay, .controls, .player::before { transition: opacity .25s; }
@@ -494,3 +494,17 @@ a.btn { text-decoration: none; }
 .install-title { font-size: 15px; font-weight: 500; line-height: 20px; }
 .install-sub { font-size: 13px; line-height: 18px; color: var(--md-on-surface-variant); }
 .install-sub .icon { font-size: 17px; vertical-align: -3px; color: var(--md-primary); }
+
+/* ?debug overlay */
+.debug-log {
+  position: fixed; z-index: 50; left: 4px; right: 4px; top: calc(4px + var(--safe-t)); margin: 0;
+  max-height: 45vh; overflow: hidden; pointer-events: none; padding: 6px 8px; border-radius: 6px;
+  background: rgba(0, 0, 0, .75); color: #7cff7c; font: 11px/1.35 ui-monospace, Menlo, monospace;
+  white-space: pre-wrap; word-break: break-all;
+}
+
+/* version label: there if you look for it */
+.hints { display: flex; align-items: baseline; gap: 8px; }
+.hints .hint { flex: 1; }
+.version { font-size: 10px; line-height: 14px; color: var(--md-on-surface-variant); opacity: .45; letter-spacing: .3px; }
+.login-card .version { margin-top: -4px; }

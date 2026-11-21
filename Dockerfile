@@ -7,6 +7,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+# Commit ID for the version label (.dockerignore lets only HEAD + refs through; .dockerignore
+# itself is listed so the COPY never comes up empty when building without .git)
+COPY .dockerignore .git* ./gitinfo/
 
 RUN useradd -r -u 10001 app
 USER app

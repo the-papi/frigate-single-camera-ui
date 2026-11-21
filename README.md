@@ -99,7 +99,8 @@ Roboto and Material Symbols from CDNs. `sw.js` caches the app shell but never ca
 | sign in | `POST /api/login` |
 | cameras | `GET /api/config` |
 | motion + recording coverage | `GET /api/<camera>/recordings?after=&before=` |
-| playback | `GET /vod/<camera>/start/<ts>/end/<ts>/index.m3u8` |
+| playback | `GET /vod/<camera>/start/<ts>/end/<ts>/master.m3u8` |
+| preview frame while loading / scrubbing | `GET /api/<camera>/recordings/<ts>/snapshot.jpg` |
 | live video | WebSocket `/live/mse/api/ws?src=<go2rtc stream>` (MSE) |
 | live fallback | `GET /api/<camera>/latest.jpg` (snapshots from the detect stream) |
 | clips | `GET /api/<camera>/start/<ts>/end/<ts>/clip.mp4` |
@@ -131,6 +132,13 @@ at the top of the motion section in `app/static/app.js` if it stops too often or
 Frigate writes recordings in ~10 s segments with a short delay, so after **Stop** the app
 waits until the end of the clip is on disk (usually 10–20 s) before fetching it. Clips over
 15 min skip the in-app preview and download directly.
+
+### Troubleshooting playback
+
+Open the app with `?debug` (e.g. `https://cam.example.com/?debug`) to show a log of what the
+recorded-video player does (load, seek, stall, errors, buffered ranges). `?player=native` or
+`?player=hls` forces Safari's built-in HLS player or hls.js (remembered; `?player=auto` resets).
+The version (commit ID) is shown in small print under the timeline and on the login screen.
 
 ## Keyboard (desktop)
 

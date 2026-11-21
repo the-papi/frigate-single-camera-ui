@@ -46,6 +46,11 @@ There is no test suite; see "Verifying changes" below.
   it can report failures as close codes (`4401` = not signed in, `4502` = upstream failed).
   No `Origin` header is sent upstream (go2rtc's origin check passes without one).
 - No configuration-specific data in code: everything comes from env vars (see `.env.example`).
+- Version label = short commit ID: `.dockerignore` lets only `.git/HEAD`, `refs/heads` and
+  `packed-refs` into the build, the Dockerfile copies them to `gitinfo/`, `read_version()`
+  resolves them ("dev" without git); rendered into index.html as `{{VERSION}}`.
+- The proxy accepts HEAD (Apple's media stack sends it) and forwards the client's
+  `Accept-Encoding` (bodies are passed through, so never ask Frigate for more than the client takes).
 
 ## Frontend (app/static/app.js)
 
@@ -57,7 +62,10 @@ There is no test suite; see "Verifying changes" below.
   so `wallToVideo` / `videoToWall` map between video time and wall time using that hour's segment
   list. `ended` continues into the next hour; reaching "now" switches to live. On iOS Safari's
   native HLS is used (hls.js on ManagedMediaSource was slow / got stuck there), hls.js everywhere else and as
-  fallback. `playSeq` lets a newer seek cancel a `playAt` still waiting for recordings.
+  fallback (`?player=native|hls` forces one, `?debug` shows a player event log). Uses
+  `master.m3u8` like Frigate's UI. While the video loads, or while scrubbing outside the loaded
+  hour, `#preview` shows a still from `/api/<cam>/recordings/<t>/snapshot.jpg`. `playSeq` lets a
+  newer seek cancel a `playAt` still waiting for recordings.
 - **Timeline**: the playhead is always in the middle (`state.view` is derived from `state.cur` +
   `state.span` in `syncView()`). Dragging scrubs (`scrubStart/To/End`: preview seeks inside the
   loaded hour, `playAt` on release). It is a canvas: coverage + motion bars bucketed per 2 px, normalized to the

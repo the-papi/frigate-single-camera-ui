@@ -23,6 +23,23 @@ const floorHour = (t) => Math.floor(t / HOUR) * HOUR;
 const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
               (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1); // iPadOS
 
+// Troubleshooting: ?debug shows what the recorded-playback player is doing,
+// ?player=native|hls forces one player (sticky, ?player=auto resets).
+const params = new URLSearchParams(location.search);
+const DEBUG = params.has('debug');
+let forcedPlayer = null;
+try {
+  if (params.has('player')) localStorage.setItem('player', params.get('player'));
+  forcedPlayer = { native: 'native', hls: 'hls' }[localStorage.getItem('player')] || null;
+} catch {}
+const dbgLines = [];
+const t0 = performance.now();
+function dbg(msg) {
+  if (!DEBUG) return;
+  dbgLines.push(`${((performance.now() - t0) / 1000).toFixed(1)} ${msg}`);
+  if (dbgLines.length > 16) dbgLines.shift();
+}
+
 const state = {
   camera: null,
   mode: 'live',               // 'live' | 'playback'
@@ -257,6 +274,7 @@ function setMode(mode) {
   $('streamWrap').hidden = !live || liveStreams.length < 2;
   updateFullscreenBtn();
   if (live) {
+    hidePreview();
     video.pause();
     $('spinner').hidden = true;
     startLive();
@@ -529,7 +547,7 @@ async function playAt(t, { autoplay = true, dir = 1, previewEnd = null } = {}) {
   state.previewEnd = previewEnd;
   for (let guard = 0; guard < 24 * 7; guard++) {
     if (t >= now() - 5) {
-      if (state.mode === 'live') state.cur = now(); else goLive();
+      if (state.mode === 'live') { state.cur = now(); hidePreview(); } else goLive();
       return;
     }
     const hour = floorHour(t);
@@ -562,12 +580,56 @@ async function playAt(t, { autoplay = true, dir = 1, previewEnd = null } = {}) {
 }
 
 let nativeHlsFailed = false;
+// ---- preview frame
+//
+// Loading recorded video can take a moment (especially on iPhones), so show a
+// still of the target moment meanwhile (Frigate cuts it from the recording),
+// and while scrubbing outside the loaded hour. Hidden once the video has the frame.
+
+const preview = $('preview');
+let previewOn = false, previewWant = null, previewBusy = false;
+
+function showPreview(t) {
+  previewOn = true;
+  previewWant = t;
+  if (!previewBusy) loadPreview(); // one request at a time, the latest wish wins
+}
+
+function loadPreview() {
+  const t = previewWant;
+  previewWant = null;
+  if (t == null || !state.camera) return;
+  previewBusy = true;
+  const img = new Image();
+  const done = (ok) => {
+    previewBusy = false;
+    if (ok && previewOn) { preview.src = img.src; preview.hidden = false; }
+    if (previewWant != null) loadPreview();
+  };
+  img.onload = () => done(true);
+  img.onerror = () => done(false); // e.g. a gap in the recordings
+  img.src = `/api/${encodeURIComponent(state.camera)}/recordings/${t.toFixed(1)}/snapshot.jpg?height=480`;
+}
+
+function hidePreview() {
+  previewOn = false;
+  previewWant = null;
+  preview.hidden = true;
+}
+
+const isBuffered = (v) => {
+  const b = video.buffered;
+  for (let i = 0; i < b.length; i++) if (v >= b.start(i) && v <= b.end(i) - 0.3) return true;
+  return false;
+};
+
 function loadAndSeek(cam, hour, segs, t, autoplay) {
   setMode('playback');
   state.cur = t;
   const same = state.win && state.win.camera === cam && state.win.start === hour &&
                state.win.segs.length === segs.length;
   if (same) {
+    if (!isBuffered(wallToVideo(t))) showPreview(t);
     video.currentTime = wallToVideo(t);
     if (autoplay) video.play().catch(() => {});
     return;
@@ -575,7 +637,10 @@ function loadAndSeek(cam, hour, segs, t, autoplay) {
 
   state.win = { camera: cam, start: hour, segs };
   const startPos = wallToVideo(t);
-  const url = `/vod/${encodeURIComponent(cam)}/start/${hour}/end/${hour + HOUR}/index.m3u8`;
+  showPreview(t);
+  // master.m3u8 (like Frigate's own UI) announces codecs + bitrate, which Apple's player wants up front
+  const url = `/vod/${encodeURIComponent(cam)}/start/${hour}/end/${hour + HOUR}/master.m3u8`;
+  dbg(`load ${new Date(hour * 1000).toLocaleTimeString()} +${Math.round(startPos)}s`);
   $('spinner').hidden = false;
 
   if (hls) { hls.destroy(); hls = null; }
@@ -587,20 +652,32 @@ function loadAndSeek(cam, hour, segs, t, autoplay) {
 
   // iPhone / iPad: Safari's native HLS player starts faster and stalls less than
   // hls.js on ManagedMediaSource. Elsewhere (and if native fails) use hls.js.
+  const hlsOk = !!(window.Hls && Hls.isSupported());
   const native = video.canPlayType('application/vnd.apple.mpegurl');
-  if (native && (isIOS || !(window.Hls && Hls.isSupported())) && !nativeHlsFailed) {
+  const useNative = forcedPlayer ? forcedPlayer === 'native'
+    : native && (isIOS || !hlsOk) && !nativeHlsFailed;
+  dbg(`player: ${useNative ? 'native' : 'hls.js'}`);
+  if (useNative) {
     video.src = url;
     video.addEventListener('loadedmetadata', onReady, { once: true });
     video.onerror = () => {
       video.onerror = null;
-      if (!window.Hls || !Hls.isSupported()) { toast('Playback error', true); $('spinner').hidden = true; return; }
+      dbg(`native error ${video.error?.code}: ${video.error?.message || ''}`);
+      if (!hlsOk || forcedPlayer) { toast('Playback error', true); $('spinner').hidden = true; return; }
       nativeHlsFailed = true; // fall back to hls.js from now on
       state.win = null;
       loadAndSeek(cam, hour, segs, t, autoplay);
     };
-  } else if (window.Hls && Hls.isSupported()) {
+  } else if (hlsOk) {
     video.onerror = null;
-    hls = new Hls({ startPosition: startPos, maxBufferLength: 30, enableWorker: true });
+    // iPhones (ManagedMediaSource) get small buffers like in Frigate's UI, they evict aggressively
+    hls = new Hls(isIOS ? { startPosition: startPos, maxBufferLength: 10, maxBufferSize: 20e6, enableWorker: true }
+                        : { startPosition: startPos, maxBufferLength: 30, enableWorker: true });
+    if (DEBUG) {
+      hls.on(Hls.Events.MANIFEST_PARSED, (_e, d) => dbg(`manifest: ${d.levels.length} level(s) ${d.levels[0]?.codecSet || ''}`));
+      hls.on(Hls.Events.FRAG_LOADED, (_e, d) => dbg(`frag ${d.frag.sn} ${Math.round(d.frag.stats.loading.end - d.frag.stats.loading.start)} ms`));
+      hls.on(Hls.Events.ERROR, (_e, d) => dbg(`hls ${d.fatal ? 'FATAL ' : ''}${d.details}`));
+    }
     hls.on(Hls.Events.MANIFEST_PARSED, onReady);
     hls.on(Hls.Events.ERROR, (_e, data) => {
       if (!data.fatal) return;
@@ -645,7 +722,8 @@ video.addEventListener('timeupdate', () => {
     state.previewEnd = null;
   }
 });
-video.addEventListener('playing', () => { $('spinner').hidden = true; updatePlayBtn(); });
+video.addEventListener('playing', () => { $('spinner').hidden = true; hidePreview(); updatePlayBtn(); });
+video.addEventListener('seeked', () => { if (!scrub || isBuffered(video.currentTime)) hidePreview(); });
 video.addEventListener('pause', updatePlayBtn);
 video.addEventListener('play', updatePlayBtn);
 video.addEventListener('waiting', () => { $('spinner').hidden = false; });
@@ -874,12 +952,13 @@ function scrubTo(t) {
   dirty = true;
   const w = state.win;
   const at = performance.now();
-  if (state.mode === 'playback' && w && w.camera === state.camera && floorHour(state.cur) === w.start &&
-      at - scrub.seekAt > 150) {
+  const inWin = state.mode === 'playback' && w && w.camera === state.camera && floorHour(state.cur) === w.start;
+  if (inWin && at - scrub.seekAt > 150) {
     scrub.seekAt = at;
     const v = wallToVideo(state.cur);
     if (video.fastSeek) video.fastSeek(v); else video.currentTime = v;
   }
+  if (!inWin || !isBuffered(wallToVideo(state.cur))) showPreview(state.cur);
 }
 
 function scrubEnd() {
@@ -1555,6 +1634,23 @@ async function start() {
   const cam = [saved, ui.default_camera].find((c) => c && cams.includes(c)) || cams[0];
   sel.value = cam;
   selectCamera(cam);
+}
+
+if (DEBUG) {
+  const box = document.createElement('pre');
+  box.className = 'debug-log';
+  document.body.append(box);
+  for (const n of ['loadstart', 'loadedmetadata', 'loadeddata', 'canplay', 'playing', 'waiting', 'stalled',
+                   'seeking', 'seeked', 'pause', 'ended']) {
+    video.addEventListener(n, () => dbg(`${n} @${video.currentTime.toFixed(1)}`));
+  }
+  setInterval(() => {
+    const b = video.buffered;
+    const ranges = [...Array(b.length)].map((_, i) => `${b.start(i).toFixed(0)}-${b.end(i).toFixed(0)}`).join(',');
+    box.textContent = `${state.mode} ${forcedPlayer || 'auto'}${isIOS ? ' iOS' : ''} rs=${video.readyState} ns=${video.networkState}` +
+      ` t=${video.currentTime.toFixed(1)}/${(video.duration || 0).toFixed(0)} buf=${ranges || '-'}` +
+      `${video.paused ? ' paused' : ''}${video.error ? ' err=' + video.error.code : ''}\n` + dbgLines.join('\n');
+  }, 500);
 }
 
 readColors();

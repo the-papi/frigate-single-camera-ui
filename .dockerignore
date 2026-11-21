@@ -2,3 +2,7 @@
 docker-compose.traefik.yaml
 **/__pycache__
 .git
+# ...except what's needed to show the commit ID as the app version
+!.git/HEAD
+!.git/packed-refs
+!.git/refs/heads

@@ -37,6 +37,7 @@
       </label>
       <p id="loginError" class="login-error" hidden></p>
       <button class="btn filled wide" id="loginBtn" type="submit">Sign in</button>
+      <span class="version">{{VERSION}}</span>
     </form>
   </div>
 
@@ -61,6 +62,7 @@
           <img id="live" alt="Live view" draggable="false">
           <video id="liveVideo" playsinline muted autoplay hidden></video>
           <video id="liveVideo2" playsinline muted autoplay hidden></video>
+          <img id="preview" alt="" draggable="false" hidden>
         </div>
         <div id="seekFlash" class="seek-flash" hidden><span class="icon">fast_rewind</span><span>10 s</span></div>
         <div id="spinner" class="spinner" hidden></div>
@@ -113,8 +115,11 @@
           <button class="icon-btn small" id="zoomIn" aria-label="Zoom in" title="Zoom in (+)"><span class="icon">zoom_in</span></button>
         </div>
         <canvas id="timeline"></canvas>
+        <div class="hints">
         <p class="hint mouse">Drag to scrub · scroll to zoom · click to play</p>
         <p class="hint touch">Drag to scrub · pinch to zoom · tap to play</p>
+        <span class="version">{{VERSION}}</span>
+        </div>
       </div>
 
       </div>

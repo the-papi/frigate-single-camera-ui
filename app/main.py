@@ -36,10 +36,33 @@ SESSION_DAYS = int(os.environ.get("SESSION_DAYS", "30"))
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
+
+def read_version() -> str:
+    """Short commit ID from the git files copied into the image (see Dockerfile), else "dev"."""
+    root = os.path.join(os.path.dirname(__file__), "..", "gitinfo")
+    for git in (root, os.path.join(os.path.dirname(__file__), "..", ".git")):
+        try:
+            head = open(os.path.join(git, "HEAD")).read().strip()
+            if not head.startswith("ref: "):
+                return head[:7]
+            ref = head[5:]
+            try:
+                return open(os.path.join(git, ref)).read().strip()[:7]
+            except OSError:
+                for line in open(os.path.join(git, "packed-refs")):
+                    if line.rstrip().endswith(" " + ref):
+                        return line[:7]
+        except OSError:
+            continue
+    return "dev"
+
+
+VERSION = read_version()
+
 TOKEN_COOKIE = "fsu_token"   # Frigate JWT
 NAME_COOKIE = "fsu_cookie"   # Frigate's auth cookie name (frigate_token by default)
 
-REQ_HEADERS = {"range", "content-type", "accept", "if-none-match", "if-modified-since"}
+REQ_HEADERS = {"range", "content-type", "accept", "accept-encoding", "if-none-match", "if-modified-since"}
 RESP_HEADERS = {
     "content-type", "content-length", "content-encoding", "content-range", "accept-ranges",
     "content-disposition", "cache-control", "etag", "last-modified",
@@ -47,6 +70,7 @@ RESP_HEADERS = {
 
 log = logging.getLogger("frigate-ui")
 logging.basicConfig(level=logging.INFO)
+log.info("Version %s", VERSION)
 
 client: httpx.AsyncClient
 
@@ -137,7 +161,8 @@ def render_index() -> str:
     with open(os.path.join(STATIC_DIR, "index.html"), encoding="utf-8") as f:
         page = f.read()
     return (page.replace("{{APP_NAME}}", html.escape(APP_NAME))
-                .replace("{{APP_SHORT_NAME}}", html.escape(APP_SHORT_NAME)))
+                .replace("{{APP_SHORT_NAME}}", html.escape(APP_SHORT_NAME))
+                .replace("{{VERSION}}", html.escape(VERSION)))
 
 
 # Served from the root so the service worker controls the whole app.
@@ -240,11 +265,12 @@ async def live_ws(websocket: WebSocket, path: str):
 
 # ---------------------------------------------------------------------- proxy
 
-@app.api_route("/{prefix:path}", methods=["GET", "POST", "DELETE", "PUT", "PATCH"])
+# HEAD too: Apple's media stack probes video URLs with it.
+@app.api_route("/{prefix:path}", methods=["GET", "HEAD", "POST", "DELETE", "PUT", "PATCH"])
 async def proxy(prefix: str, request: Request):
     top = prefix.split("/", 1)[0]
     if top not in ("api", "vod"):
-        if request.method == "GET" and prefix in ("", "index.html"):
+        if request.method in ("GET", "HEAD") and prefix in ("", "index.html"):
             return HTMLResponse(render_index(), headers={"Cache-Control": "no-cache"})
         return JSONResponse({"detail": "Not found"}, status_code=404)
 
@@ -254,6 +280,8 @@ async def proxy(prefix: str, request: Request):
         return JSONResponse({"detail": "Not signed in"}, status_code=401)
 
     headers = {k: v for k, v in request.headers.items() if k.lower() in REQ_HEADERS}
+    # The body is passed through as-is, so only ask Frigate for encodings the client accepts.
+    headers.setdefault("accept-encoding", "identity")
     headers["cookie"] = f"{name}={token}"
     body = await request.body()
     try:
