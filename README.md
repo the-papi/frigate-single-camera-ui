@@ -4,8 +4,11 @@ A small, phone-friendly web app (installable PWA, Material Design 3) for watchin
 [Frigate](https://frigate.video) camera. It was built for watching a pet, and is meant to be simpler than the full Frigate UI.
 
 - **Video**: live video (go2rtc, same as Frigate's own live view) with a stream / quality picker,
-  recorded playback (Frigate VOD / HLS), 1–16× speed, fullscreen
-- **Timeline**: drag to pan, pinch / scroll to zoom (1 min – 3 days), tap to play from there.
+  recorded playback (Frigate VOD / HLS), 1–16× speed, fullscreen.
+  Double-tap the left / right side of the video to skip ∓10 s (keep tapping for more);
+  pinch / scroll wheel zooms into the picture (up to 8×), drag to look around while zoomed
+- **Timeline**: the playhead stays in the middle; drag the timeline to scrub through the video,
+  pinch / scroll to zoom (1 min – 3 days), tap to play from there.
   Shaded = recording exists, orange bars = **motion** (Frigate's motion detection, not objects).
   Faded bars are minor motion.
 - **Skip**: ±10 s, and ⏮ / ⏭ to jump to the previous / next **significant motion**
@@ -69,6 +72,25 @@ it forwards to Frigate.
 The server keeps no credentials or state. When Frigate rejects the token, the login
 screen is shown again.
 
+### Staying signed in
+
+How long you stay signed in is decided by Frigate, not by this app: the token Frigate hands
+out expires after `auth.session_length` (default 24 h) and is only renewed when the app is used
+within `auth.refresh_time` (default 30 min) of expiring. So with the defaults you're signed out
+about once a day. To stay signed in as long as you open the app at least once a month, add this
+to Frigate's config:
+
+```yaml
+auth:
+  session_length: 2592000  # token lives 30 days
+  refresh_time: 2505600    # renewed on any use after the first day → expires 30 days after last use
+```
+
+Keep `SESSION_DAYS` (default 30) at least as long. The password is never stored; the token sits
+in an httpOnly, SameSite=Lax cookie (Secure on HTTPS). A Frigate JWT can't be revoked before it
+expires, so a longer session means a stolen token stays valid longer; rotating Frigate's JWT
+secret signs everyone out.
+
 The frontend is plain HTML/CSS/JS in `app/static/` (no build step) and uses hls.js,
 Roboto and Material Symbols from CDNs. `sw.js` caches the app shell but never camera data.
 
@@ -88,6 +110,8 @@ Live video is streamed from go2rtc through Frigate's `/live/` endpoint, like Fri
 The picker on the video lists the camera's streams: the ones in `cameras.<name>.live.streams`
 (Frigate 0.15+) or `live.stream_name`, plus go2rtc streams named after the camera (`<camera>`
 → "Main", `<camera>_sub` → "sub"). The last choice is remembered per camera.
+To show video sooner, a lower-quality stream of the same camera (a name or label containing
+`sub`, `low`, `sd`, …) is started at the same time and shown until the picked stream plays.
 
 If live video can't play (older iPhones without MSE / ManagedMediaSource, a codec the browser
 can't decode such as H.265 in most browsers, or the stream missing in go2rtc), the app falls back

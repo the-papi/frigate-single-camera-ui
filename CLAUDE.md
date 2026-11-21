@@ -55,8 +55,12 @@ There is no test suite; see "Verifying changes" below.
 - **Playback** loads Frigate VOD HLS one clock hour at a time
   (`/vod/<cam>/start/<h>/end/<h+3600>/index.m3u8`). VOD concatenates segments and **skips gaps**,
   so `wallToVideo` / `videoToWall` map between video time and wall time using that hour's segment
-  list. `ended` continues into the next hour; reaching "now" switches to live.
-- **Timeline** is a canvas: coverage + motion bars bucketed per 2 px, normalized to the
+  list. `ended` continues into the next hour; reaching "now" switches to live. On iOS Safari's
+  native HLS is used (hls.js on ManagedMediaSource was slow / got stuck there), hls.js everywhere else and as
+  fallback. `playSeq` lets a newer seek cancel a `playAt` still waiting for recordings.
+- **Timeline**: the playhead is always in the middle (`state.view` is derived from `state.cur` +
+  `state.span` in `syncView()`). Dragging scrubs (`scrubStart/To/End`: preview seeks inside the
+  loaded hour, `playAt` on release). It is a canvas: coverage + motion bars bucketed per 2 px, normalized to the
   95th percentile. Colors come from CSS custom properties via `readColors()` (light/dark aware);
   don't hard-code colors in `draw()`.
 - **Significant motion** (⏮/⏭, faded "minor" bars): segment motion ≥ `SIG_FRACTION` × 90th
@@ -69,7 +73,13 @@ There is no test suite; see "Verifying changes" below.
   `{type:'mse', value:<codecs>}`, receive `{type:'mse', value:<mime>}`, then binary fMP4.
   Uses `ManagedMediaSource` on iOS 17.1+. Snapshots (`latest.jpg`, detect stream) are the
   placeholder and the fallback. Streams come from `live.streams`, `live.stream_name` and go2rtc
-  streams named `<cam>` / `<cam>_*`. Live is stopped while the page is hidden.
+  streams named `<cam>` / `<cam>_*`. A "quick" low-res stream (`quickStream()`, name/label
+  matching sub/low/sd…) starts in a second `<video>` alongside the picked one and is dropped once
+  the picked one plays. Live is stopped while the page is hidden.
+- **Video gestures** (pointer events on `#player`, controls in `.overlay` excluded): double-tap
+  a half → ∓10 s via `playAt` (further taps within 700 ms add 10 s each); pinch / wheel zooms
+  the `#stage` wrapper with a CSS transform (`zv`, clamped so the picture covers the player),
+  drag pans when zoomed, `#zoomReset` chip resets.
 - **Install banner**: `beforeinstallprompt` on Chromium; Share → Add to Home Screen text on iOS.
 
 ## UI conventions
@@ -77,7 +87,9 @@ There is no test suite; see "Verifying changes" below.
 - Material Design 3: use the `--md-*` tokens and existing components (`.btn.filled/.tonal/.text`,
   `.icon-btn`, `.fab`, `.chip`, `.card`, `.video-chip`, `.snackbar`, bottom `.sheet`).
   Icons are Material Symbols Rounded (`<span class="icon">name</span>`).
-- Mobile first: check at ~390 px wide. 48 px touch targets, safe-area insets (`--safe-*`), and
+- Mobile first: check at ~390 px wide, and phone landscape (~844×390: fullscreen video with
+  `#controls` (transport + timeline) laid over its bottom edge; they auto-hide after 4 s of
+  playback via `body.controls-hidden`, a single tap on the video toggles them). 48 px touch targets, safe-area insets (`--safe-*`), and
   pointer events that work for touch (pan, pinch-zoom, tap). Desktop gets keyboard shortcuts.
 - Toggle visibility with the `hidden` attribute (CSS forces `display:none`).
 - JS: 2-space indent, no dependencies besides hls.js (CDN). Python: 4-space, keep it in one file.

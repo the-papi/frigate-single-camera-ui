@@ -20,16 +20,18 @@ const MAX_SPAN = 3 * 24 * HOUR; // 3 days
 const MAX_SHARE_CLIP = 15 * 60; // clips longer than this are not buffered in memory on phones
 const now = () => Date.now() / 1000;
 const floorHour = (t) => Math.floor(t / HOUR) * HOUR;
+const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+              (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1); // iPadOS
 
 const state = {
   camera: null,
   mode: 'live',               // 'live' | 'playback'
-  cur: now(),                 // playhead (wall time)
-  view: { start: now() - HOUR, end: now() + 180 },
+  cur: now(),                 // playhead (wall time), always in the middle of the timeline
+  span: HOUR,                 // visible timeline span (seconds)
+  view: { start: now() - HOUR / 2, end: now() + HOUR / 2 }, // derived from cur + span, see syncView()
   win: null,                  // loaded HLS window {camera, start, segs}
   rec: null,                  // {start, camera} while recording a clip
   rate: 1,
-  following: true,            // auto-scroll timeline with playhead
   previewEnd: null,
 };
 
@@ -204,10 +206,7 @@ async function skipMotion(dir) {
       toast(dir > 0 ? 'No newer motion' : 'No earlier motion in the last 3 days');
       return;
     }
-    const target = t - PREROLL;
-    state.following = true;
-    if (target < state.view.start || target > state.view.end) centerView(target, 0.3);
-    await playAt(target);
+    await playAt(t - PREROLL);
   } catch (e) {
     if (signedIn) toast(`Motion search failed: ${e.message}`, true);
   } finally {
@@ -264,7 +263,6 @@ function setMode(mode) {
   } else {
     stopLive();
     liveImg.hidden = true;
-    liveVideo.hidden = true;
   }
   updatePlayBtn();
 }
@@ -282,12 +280,18 @@ function updateFullscreenBtn() {
 // does it. Until the video plays (or if it can't: no MSE on older iPhones,
 // unsupported codec, stream missing) we show snapshots from the detect stream.
 
-const liveVideo = $('liveVideo');
+// To show video sooner, a low-quality stream of the same camera (e.g.
+// "<cam>_sub") is started alongside the picked one; whichever plays first is
+// shown and the picked stream takes over as soon as it plays.
+
+const liveEls = [$('liveVideo'), $('liveVideo2')];
+let liveVideo = liveEls[0];       // the live <video> currently shown
 const MSE_CODECS = ['avc1.640029', 'avc1.64002A', 'avc1.640033', 'hvc1.1.6.L153.B0',
                     'mp4a.40.2', 'mp4a.40.5', 'flac', 'opus'];
 let liveStreams = [];             // [{label, name}] go2rtc streams for the current camera
 const liveBroken = new Set();     // streams that failed to play: use snapshots for them
-let liveToken = 0, snapTimer = null, liveRetry = null, liveConn = null;
+let liveToken = 0, snapTimer = null, snapGen = 0, liveRetry = null;
+let liveConns = [];               // [{ws, el, name, primary, played, closed}]
 
 function findLiveStreams(cfg, cam) {
   const c = cfg.cameras?.[cam] || {};
@@ -308,65 +312,96 @@ function currentStream() {
   return liveStreams.find((s) => s.name === $('stream').value) || liveStreams[0];
 }
 
+/** A lower-quality stream of this camera that starts faster than `main`, if there is one. */
+function quickStream(main) {
+  return liveStreams.find((s) => s !== main && !liveBroken.has(s.name) &&
+                                 /sub|low|\bsd\b|lq|small|mobile/i.test(`${s.label} ${s.name}`)) || null;
+}
+
+function resetLiveEl(el) {
+  el.oncanplay = el.onplaying = null;
+  el.pause();
+  el.removeAttribute('src');
+  el.srcObject = null;
+  el.load();
+  el.hidden = true;
+}
+
+function closeConn(conn) {
+  conn.closed = true;
+  if (conn.ws) { try { conn.ws.close(); } catch {} }
+  liveConns = liveConns.filter((c) => c !== conn);
+  resetLiveEl(conn.el);
+}
+
 function stopLive() {
   liveToken++;
   clearTimeout(snapTimer);
   clearTimeout(liveRetry);
-  if (liveConn) { try { liveConn.ws.close(); } catch {} liveConn = null; }
-  liveVideo.pause();
-  liveVideo.removeAttribute('src');
-  liveVideo.srcObject = null;
-  liveVideo.load();
+  for (const c of [...liveConns]) closeConn(c);
+}
+
+function showSnapshots() {
+  liveImg.hidden = false;
+  startSnapshots(liveToken);
+  updateFullscreenBtn();
 }
 
 function startLive() {
   stopLive();
   const token = liveToken;
-  liveVideo.hidden = true;
-  liveImg.hidden = false;
-  startSnapshots(token);
-  const stream = currentStream();
+  showSnapshots();
   const MS = window.ManagedMediaSource || window.MediaSource;
-  if (stream && MS && !liveBroken.has(stream.name)) connectLiveVideo(token, stream.name, MS);
+  const main = currentStream();
+  if (!main || !MS) return;
+  const quick = quickStream(main);
+  const target = liveBroken.has(main.name) ? quick : main;
+  if (!target) return;
+  connectLiveVideo(token, target.name, MS, liveEls[0], true);
+  if (quick && quick !== target) connectLiveVideo(token, quick.name, MS, liveEls[1], false);
 }
 
 function startSnapshots(token) {
+  clearTimeout(snapTimer);
+  const gen = ++snapGen;
   const tick = () => {
-    if (state.mode !== 'live' || token !== liveToken || !state.camera || liveImg.hidden) return;
+    if (gen !== snapGen || state.mode !== 'live' || token !== liveToken || !state.camera || liveImg.hidden) return;
     if (document.hidden) { snapTimer = setTimeout(tick, 1000); return; }
     const img = new Image();
     img.onload = () => {
-      if (token !== liveToken || liveImg.hidden) return;
+      if (gen !== snapGen || token !== liveToken || liveImg.hidden) return;
       liveImg.src = img.src;
       snapTimer = setTimeout(tick, 500);
     };
-    img.onerror = () => { snapTimer = setTimeout(tick, 3000); };
+    img.onerror = () => { if (gen === snapGen) snapTimer = setTimeout(tick, 3000); };
     img.src = `/api/${encodeURIComponent(state.camera)}/latest.jpg?h=720&height=720&_=${Date.now()}`;
   };
   tick();
 }
 
-function connectLiveVideo(token, streamName, MS) {
+function connectLiveVideo(token, streamName, MS, el, primary) {
+  const conn = { ws: null, el, name: streamName, primary, played: false, closed: false };
+  liveConns.push(conn);
+  const alive = () => token === liveToken && !conn.closed;
   const ms = new MS();
   if (window.ManagedMediaSource && MS === window.ManagedMediaSource) {
-    liveVideo.disableRemotePlayback = true; // required for ManagedMediaSource (iOS 17.1+)
-    liveVideo.srcObject = ms;
+    el.disableRemotePlayback = true; // required for ManagedMediaSource (iOS 17.1+)
+    el.srcObject = ms;
   } else {
-    liveVideo.src = URL.createObjectURL(ms);
+    el.src = URL.createObjectURL(ms);
   }
 
   ms.addEventListener('sourceopen', () => {
-    if (token !== liveToken) return;
-    if (!window.ManagedMediaSource) URL.revokeObjectURL(liveVideo.src);
+    if (!alive()) return;
+    if (!window.ManagedMediaSource) URL.revokeObjectURL(el.src);
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(`${proto}://${location.host}/live/mse/api/ws?src=${encodeURIComponent(streamName)}`);
+    const ws = conn.ws = new WebSocket(`${proto}://${location.host}/live/mse/api/ws?src=${encodeURIComponent(streamName)}`);
     ws.binaryType = 'arraybuffer';
-    const conn = liveConn = { ws, played: false };
     let sb = null;
     let queue = [];
 
     const pump = () => {
-      if (!sb || sb.updating || token !== liveToken) return;
+      if (!sb || sb.updating || !alive()) return;
       try {
         if (queue.length) {
           const data = queue.length === 1 ? queue[0] : concatBuffers(queue);
@@ -381,7 +416,7 @@ function connectLiveVideo(token, streamName, MS) {
       // stay at the live edge (the browser drifts behind after stalls / backgrounding)
       if (sb.buffered.length) {
         const end = sb.buffered.end(sb.buffered.length - 1);
-        if (end - liveVideo.currentTime > 3) liveVideo.currentTime = end - 0.5;
+        if (end - el.currentTime > 3) el.currentTime = end - 0.5;
       }
     };
 
@@ -390,7 +425,7 @@ function connectLiveVideo(token, streamName, MS) {
       ws.send(JSON.stringify({ type: 'mse', value: codecs }));
     };
     ws.onmessage = (ev) => {
-      if (token !== liveToken) return;
+      if (!alive()) return;
       if (typeof ev.data === 'string') {
         let msg = {};
         try { msg = JSON.parse(ev.data); } catch {}
@@ -400,10 +435,10 @@ function connectLiveVideo(token, streamName, MS) {
             sb.mode = 'segments';
             sb.addEventListener('updateend', pump);
           } catch (e) {
-            liveFailed(token, conn, streamName, `unsupported codec (${msg.value})`);
+            liveFailed(token, conn, `unsupported codec (${msg.value})`);
           }
         } else if (msg.type === 'error') {
-          liveFailed(token, conn, streamName, msg.value);
+          liveFailed(token, conn, msg.value);
         }
         return;
       }
@@ -411,19 +446,23 @@ function connectLiveVideo(token, streamName, MS) {
       pump();
     };
     ws.onclose = (ev) => {
-      if (token !== liveToken) return;
+      if (!alive()) return;
       if (ev.code === 4401) { api('/api/config').catch(() => {}); return; } // triggers the login screen
-      liveFailed(token, conn, streamName, 'connection closed');
+      liveFailed(token, conn, 'connection closed');
     };
   }, { once: true });
 
-  liveVideo.oncanplay = () => liveVideo.play().catch(() => {});
-  liveVideo.onplaying = () => {
-    if (token !== liveToken) return;
-    if (liveConn) liveConn.played = true;
-    liveVideo.hidden = false;
+  el.oncanplay = () => el.play().catch(() => {});
+  el.onplaying = () => {
+    if (!alive() || conn.played) return;
+    conn.played = true;
+    const other = liveConns.find((c) => c !== conn);
+    if (!primary && other?.played) { closeConn(conn); return; } // the picked stream already won
+    liveVideo = el;
+    el.hidden = false;
     liveImg.hidden = true;  // also stops the snapshot loop
     clearTimeout(snapTimer);
+    if (primary && other) closeConn(other); // hand-over done: drop the quick stream
     updateFullscreenBtn();
   };
 }
@@ -437,21 +476,31 @@ function concatBuffers(chunks) {
   return out;
 }
 
-function liveFailed(token, conn, streamName, reason) {
-  if (token !== liveToken) return;
-  const wasPlaying = conn?.played;
+function liveFailed(token, conn, reason) {
+  if (token !== liveToken || conn.closed) return;
+  if (!conn.primary) {
+    // the quick stream is only a head start – drop it quietly
+    const shown = !conn.el.hidden;
+    closeConn(conn);
+    if (shown) showSnapshots();
+    return;
+  }
+  const wasPlaying = conn.played;
   stopLive(); // invalidates token
   const t = liveToken;
-  liveVideo.hidden = true;
-  liveImg.hidden = false;
-  startSnapshots(t);
-  updateFullscreenBtn();
+  showSnapshots();
   if (wasPlaying) {
     // dropped after it worked (network hiccup, Frigate restart): reconnect shortly
     liveRetry = setTimeout(() => { if (state.mode === 'live' && t === liveToken && !document.hidden) startLive(); }, 3000);
+    return;
+  }
+  liveBroken.add(conn.name);
+  console.warn(`Live stream ${conn.name} unavailable:`, reason);
+  const fallback = quickStream(currentStream());
+  if (fallback) {
+    toast(`Selected stream unavailable – showing ${fallback.label}`);
+    startLive();
   } else {
-    liveBroken.add(streamName);
-    console.warn('Live video unavailable, using snapshots:', reason);
     toast('Live video unavailable – showing snapshots instead');
   }
 }
@@ -465,21 +514,24 @@ $('stream').onchange = () => {
 function goLive() {
   if (hls) { hls.destroy(); hls = null; }
   state.win = null;
-  state.following = true;
   setMode('live');
   state.cur = now();
-  centerView(state.cur, 0.85);
 }
 
 /**
  * Start recorded playback at wall time t (snapped to the nearest recording
  * if t falls into a gap). dir < 0 means "searching backwards".
  */
+let playSeq = 0; // a newer seek / drag cancels a playAt() still waiting for recordings
 async function playAt(t, { autoplay = true, dir = 1, previewEnd = null } = {}) {
   const cam = state.camera;
+  const seq = ++playSeq;
   state.previewEnd = previewEnd;
   for (let guard = 0; guard < 24 * 7; guard++) {
-    if (t >= now() - 5) { goLive(); return; }
+    if (t >= now() - 5) {
+      if (state.mode === 'live') state.cur = now(); else goLive();
+      return;
+    }
     const hour = floorHour(t);
     const isCurrent = hour + HOUR > now() - 60;
     let segs;
@@ -489,7 +541,7 @@ async function playAt(t, { autoplay = true, dir = 1, previewEnd = null } = {}) {
       if (signedIn) toast(`Failed to load recordings: ${e.message}`, true);
       return;
     }
-    if (cam !== state.camera) return;
+    if (cam !== state.camera || seq !== playSeq || scrub) return;
 
     if (dir < 0) {
       // Last segment starting before t; if t is in a gap after it, jump near its end.
@@ -509,6 +561,7 @@ async function playAt(t, { autoplay = true, dir = 1, previewEnd = null } = {}) {
   toast('No recordings found there', true);
 }
 
+let nativeHlsFailed = false;
 function loadAndSeek(cam, hour, segs, t, autoplay) {
   setMode('playback');
   state.cur = t;
@@ -532,7 +585,21 @@ function loadAndSeek(cam, hour, segs, t, autoplay) {
     if (autoplay) video.play().catch(() => {});
   };
 
-  if (window.Hls && Hls.isSupported()) {
+  // iPhone / iPad: Safari's native HLS player starts faster and stalls less than
+  // hls.js on ManagedMediaSource. Elsewhere (and if native fails) use hls.js.
+  const native = video.canPlayType('application/vnd.apple.mpegurl');
+  if (native && (isIOS || !(window.Hls && Hls.isSupported())) && !nativeHlsFailed) {
+    video.src = url;
+    video.addEventListener('loadedmetadata', onReady, { once: true });
+    video.onerror = () => {
+      video.onerror = null;
+      if (!window.Hls || !Hls.isSupported()) { toast('Playback error', true); $('spinner').hidden = true; return; }
+      nativeHlsFailed = true; // fall back to hls.js from now on
+      state.win = null;
+      loadAndSeek(cam, hour, segs, t, autoplay);
+    };
+  } else if (window.Hls && Hls.isSupported()) {
+    video.onerror = null;
     hls = new Hls({ startPosition: startPos, maxBufferLength: 30, enableWorker: true });
     hls.on(Hls.Events.MANIFEST_PARSED, onReady);
     hls.on(Hls.Events.ERROR, (_e, data) => {
@@ -544,10 +611,6 @@ function loadAndSeek(cam, hour, segs, t, autoplay) {
     });
     hls.loadSource(url);
     hls.attachMedia(video);
-  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-    // iOS Safari: native HLS
-    video.src = url;
-    video.addEventListener('loadedmetadata', onReady, { once: true });
   } else {
     toast('This browser cannot play HLS', true);
   }
@@ -567,7 +630,7 @@ function step(sec) {
   playAt(t, { dir: Math.sign(sec), autoplay: state.mode === 'live' || !video.paused });
 }
 
-const playheadTime = () => (state.mode === 'live' ? now() : state.cur);
+const playheadTime = () => (state.mode === 'live' && !scrub ? now() : state.cur);
 
 function updatePlayBtn() {
   const playing = state.mode === 'live' || !video.paused;
@@ -575,7 +638,7 @@ function updatePlayBtn() {
 }
 
 video.addEventListener('timeupdate', () => {
-  if (state.mode !== 'playback' || !state.win) return;
+  if (state.mode !== 'playback' || !state.win || scrub) return;
   state.cur = videoToWall(video.currentTime);
   if (state.previewEnd && state.cur >= state.previewEnd) {
     video.pause();
@@ -614,7 +677,7 @@ new ResizeObserver(resizeCanvas).observe(canvas);
 // Timeline colors come from the CSS theme tokens (light/dark aware).
 let C = {};
 function readColors() {
-  const cs = getComputedStyle(document.documentElement);
+  const cs = getComputedStyle(canvas); // the canvas, so landscape's scoped overrides apply
   const g = (n) => cs.getPropertyValue(n).trim();
   C = {
     rec: g('--tl-rec'), motion: g('--md-primary'), label: g('--md-on-surface-variant'),
@@ -627,33 +690,24 @@ function readColors() {
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', readColors);
 const FONT = '500 11px Roboto, system-ui, sans-serif';
 
-const span = () => state.view.end - state.view.start;
+const span = () => state.span;
 const tToX = (t) => ((t - state.view.start) / span()) * cssW;
 const xToT = (x) => state.view.start + (x / cssW) * span();
 
-function setView(start, end) {
-  let s = end - start;
-  s = Math.min(MAX_SPAN, Math.max(MIN_SPAN, s));
-  const mid = (start + end) / 2;
-  start = mid - s / 2;
-  end = mid + s / 2;
-  const maxEnd = now() + s * 0.25; // don't scroll too far into the future
-  if (end > maxEnd) { start -= end - maxEnd; end = maxEnd; }
-  state.view = { start, end };
+// The playhead sits in the middle; the timeline moves underneath it.
+let lastDataKey = '';
+function syncView() {
+  state.view = { start: state.cur - state.span / 2, end: state.cur + state.span / 2 };
+  const key = `${state.camera}:${floorHour(state.view.start)}:${floorHour(state.view.end)}`;
+  if (key !== lastDataKey) { lastDataKey = key; ensureViewData(); }
+}
+
+function setSpan(s) {
+  state.span = Math.min(MAX_SPAN, Math.max(MIN_SPAN, s));
   dirty = true;
-  ensureViewData();
+  syncView();
 }
-
-function centerView(t, frac = 0.5) {
-  const s = span();
-  setView(t - s * frac, t + s * (1 - frac));
-}
-
-function zoom(factor, anchorT) {
-  if (anchorT == null) anchorT = state.cur;
-  const { start, end } = state.view;
-  setView(anchorT - (anchorT - start) * factor, anchorT + (end - anchorT) * factor);
-}
+const zoom = (factor) => setSpan(state.span * factor);
 
 const TICK_STEPS = [10, 30, 60, 300, 600, 900, 1800, 3600, 3 * 3600, 6 * 3600, 12 * 3600, 86400];
 
@@ -780,19 +834,10 @@ function draw() {
 
 let lastDrawnX = null, lastDrawnSec = 0;
 function frame() {
-  if (state.mode === 'live') state.cur = now();
+  if (state.mode === 'live' && !scrub) state.cur = now();
+  syncView();
 
-  // follow the playhead when it nears the right edge
-  if (state.following && !drag && !pinch) {
-    const s = span();
-    if (state.mode === 'live') {
-      if (state.cur > state.view.end - s * 0.1) centerView(state.cur, 0.85);
-    } else if (!video.paused && (state.cur > state.view.end - s * 0.05 || state.cur < state.view.start)) {
-      centerView(state.cur, 0.3);
-    }
-  }
-
-  const xp = Math.round(tToX(state.cur));
+  const xp = Math.round((state.cur / span()) * cssW * 2); // redraw once the timeline moved by ½ px
   const sec = Math.floor(now());
   if (dirty || xp !== lastDrawnX || sec !== lastDrawnSec) {
     draw();
@@ -805,16 +850,48 @@ function frame() {
   requestAnimationFrame(frame);
 }
 
-// ---- timeline interaction: pan, pinch-zoom, tap to seek
+// ---- timeline interaction: drag to scrub, pinch-zoom, tap to seek
+//
+// Dragging moves the timeline under the fixed playhead, so it scrubs the
+// video: while dragging, the loaded hour shows preview frames; on release
+// playback continues from there (or goes live when dragged up to "now").
 
-let drag = null;   // {x0, view0, moved}
-let pinch = null;  // {d0, view0, tMid}
+let drag = null;   // {x0, t0, moved}
+let pinch = null;  // {d0, span0}
+let scrub = null;  // {wasPlaying, seekAt} while the playhead is being dragged
 let hoverX = null;
 const pointers = new Map();
 
-function pinchInfo() {
+function scrubStart() {
+  if (scrub) return;
+  scrub = { wasPlaying: state.mode === 'live' || !video.paused, seekAt: 0 };
+  playSeq++;
+  if (state.mode === 'playback') video.pause();
+}
+
+function scrubTo(t) {
+  state.cur = Math.min(now(), t);
+  dirty = true;
+  const w = state.win;
+  const at = performance.now();
+  if (state.mode === 'playback' && w && w.camera === state.camera && floorHour(state.cur) === w.start &&
+      at - scrub.seekAt > 150) {
+    scrub.seekAt = at;
+    const v = wallToVideo(state.cur);
+    if (video.fastSeek) video.fastSeek(v); else video.currentTime = v;
+  }
+}
+
+function scrubEnd() {
+  const s = scrub;
+  if (!s) return;
+  scrub = null;
+  playAt(state.cur, { autoplay: s.wasPlaying });
+}
+
+function pinchDist() {
   const [a, b] = [...pointers.values()];
-  return { d: Math.max(20, Math.abs(a.x - b.x)), mid: (a.x + b.x) / 2 };
+  return Math.max(20, Math.abs(a.x - b.x));
 }
 
 canvas.addEventListener('pointerdown', (e) => {
@@ -822,13 +899,11 @@ canvas.addEventListener('pointerdown', (e) => {
   pointers.set(e.pointerId, { x: e.offsetX });
   if (pointers.size === 2) {
     drag = null;
-    const { d, mid } = pinchInfo();
-    pinch = { d0: d, view0: { ...state.view }, tMid: xToT(mid) };
-    state.following = false;
+    pinch = { d0: pinchDist(), span0: state.span };
     return;
   }
   if (pointers.size > 2) return;
-  drag = { x0: e.offsetX, view0: { ...state.view }, moved: false };
+  drag = { x0: e.offsetX, t0: playheadTime(), moved: false };
 });
 
 canvas.addEventListener('pointermove', (e) => {
@@ -836,12 +911,7 @@ canvas.addEventListener('pointermove', (e) => {
   if (pointers.has(e.pointerId)) pointers.get(e.pointerId).x = e.offsetX;
 
   if (pinch && pointers.size >= 2) {
-    const { d, mid } = pinchInfo();
-    const s0 = pinch.view0.end - pinch.view0.start;
-    const s1 = Math.min(MAX_SPAN, Math.max(MIN_SPAN, s0 * (pinch.d0 / d)));
-    // keep the time that was under the fingers under their (moving) midpoint
-    const start = pinch.tMid - (mid / cssW) * s1;
-    setView(start, start + s1);
+    setSpan(pinch.span0 * (pinch.d0 / pinchDist()));
     return;
   }
   if (!drag) return;
@@ -849,25 +919,22 @@ canvas.addEventListener('pointermove', (e) => {
   if (Math.abs(dx) > (e.pointerType === 'mouse' ? 4 : 8)) drag.moved = true;
   if (!drag.moved) return;
   canvas.classList.add('dragging');
-  state.following = false;
-  const dt = (dx / cssW) * (drag.view0.end - drag.view0.start);
-  setView(drag.view0.start - dt, drag.view0.end - dt);
+  scrubStart();
+  scrubTo(drag.t0 - (dx / cssW) * span());
 });
 
 function endPointer(e, cancelled) {
   pointers.delete(e.pointerId);
   if (pinch) {
-    if (pointers.size < 2) pinch = null;
+    if (pointers.size < 2) { pinch = null; scrubEnd(); }
     return;
   }
   if (!drag) return;
   canvas.classList.remove('dragging');
   const d = drag;
   drag = null;
-  if (!cancelled && !d.moved) {
-    state.following = true;
-    playAt(xToT(e.offsetX));
-  }
+  if (d.moved) scrubEnd();
+  else if (!cancelled) playAt(xToT(e.offsetX));
 }
 canvas.addEventListener('pointerup', (e) => endPointer(e, false));
 canvas.addEventListener('pointercancel', (e) => endPointer(e, true));
@@ -875,14 +942,16 @@ canvas.addEventListener('pointerleave', (e) => {
   if (e.pointerType === 'mouse') { hoverX = null; dirty = true; }
 });
 
+let wheelTimer = null;
 canvas.addEventListener('wheel', (e) => {
   e.preventDefault();
   if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
-    state.following = false;
-    const dt = (e.deltaX / cssW) * span();
-    setView(state.view.start + dt, state.view.end + dt);
+    scrubStart();
+    scrubTo(state.cur + (e.deltaX / cssW) * span());
+    clearTimeout(wheelTimer);
+    wheelTimer = setTimeout(scrubEnd, 300);
   } else {
-    zoom(Math.exp(e.deltaY * 0.002), xToT(e.offsetX));
+    zoom(Math.exp(e.deltaY * 0.002));
   }
 }, { passive: false });
 
@@ -1080,6 +1149,193 @@ $('sheetShare').onclick = async () => {
 $('sheetClose').onclick = closeSheet;
 $('sheet').addEventListener('click', (e) => { if (e.target === $('sheet')) closeSheet(); });
 
+// ---------------------------------------------------------- video gestures
+//
+// Double-tap the left / right half of the video to skip ∓10 s (keep tapping to
+// skip further, like YouTube). Pinch or the mouse wheel zooms into the picture,
+// dragging pans it while zoomed.
+
+const player = $('player');
+const stage = $('stage');
+const MAX_ZOOM = 8;
+const SKIP = 10;
+const zv = { s: 1, x: 0, y: 0 };   // stage transform: translate(x, y) scale(s)
+const vPointers = new Map();       // pointerId -> {x, y} (player coordinates)
+let vGesture = null;               // {kind: 'pan' | 'pinch', ...}
+let lastTap = null;                // {t, x, y}
+let burst = null;                  // {dir, n, base, autoplay, until} while double-tap skipping
+let tapTimer = null;
+
+function applyZoom() {
+  const W = player.clientWidth, H = player.clientHeight;
+  zv.s = Math.min(MAX_ZOOM, Math.max(1, zv.s));
+  if (zv.s < 1.02) { zv.s = 1; zv.x = zv.y = 0; }
+  zv.x = Math.min(0, Math.max(W * (1 - zv.s), zv.x));
+  zv.y = Math.min(0, Math.max(H * (1 - zv.s), zv.y));
+  stage.style.transform = zv.s === 1 ? '' : `translate(${zv.x}px, ${zv.y}px) scale(${zv.s})`;
+  player.classList.toggle('zoomed', zv.s > 1);
+  $('zoomReset').hidden = zv.s === 1;
+  $('zoomReset').lastElementChild.textContent = `${zv.s.toFixed(1)}×`;
+}
+
+/** Zoom to scale s, keeping the picture point under (px, py) where it is. */
+function zoomVideoAt(px, py, s) {
+  const cx = (px - zv.x) / zv.s, cy = (py - zv.y) / zv.s;
+  zv.s = Math.min(MAX_ZOOM, Math.max(1, s));
+  zv.x = px - cx * zv.s;
+  zv.y = py - cy * zv.s;
+  applyZoom();
+}
+
+function resetVideoZoom() {
+  zv.s = 1;
+  applyZoom();
+}
+
+function localPt(e) {
+  const r = player.getBoundingClientRect();
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+const onControl = (e) => e.target.closest('.overlay > *');
+
+function startVideoGesture() {
+  const pts = [...vPointers.values()];
+  if (pts.length >= 2) {
+    const [a, b] = pts;
+    vGesture = {
+      kind: 'pinch', moved: true, s0: zv.s, d0: Math.hypot(a.x - b.x, a.y - b.y) || 1,
+      cx: ((a.x + b.x) / 2 - zv.x) / zv.s, cy: ((a.y + b.y) / 2 - zv.y) / zv.s,
+    };
+  } else if (pts.length === 1) {
+    vGesture = { kind: 'pan', moved: false, p0: pts[0], x0: zv.x, y0: zv.y };
+  } else {
+    vGesture = null;
+  }
+}
+
+player.addEventListener('pointerdown', (e) => {
+  if (onControl(e) || (e.pointerType === 'mouse' && e.button !== 0)) return;
+  player.setPointerCapture(e.pointerId);
+  vPointers.set(e.pointerId, localPt(e));
+  startVideoGesture();
+});
+
+player.addEventListener('pointermove', (e) => {
+  const g = vGesture;
+  if (!g || !vPointers.has(e.pointerId)) return;
+  vPointers.set(e.pointerId, localPt(e));
+  const pts = [...vPointers.values()];
+  if (g.kind === 'pinch' && pts.length >= 2) {
+    const [a, b] = pts;
+    zv.s = Math.min(MAX_ZOOM, Math.max(1, g.s0 * (Math.hypot(a.x - b.x, a.y - b.y) / g.d0)));
+    // keep the picture point that was between the fingers between them
+    zv.x = (a.x + b.x) / 2 - g.cx * zv.s;
+    zv.y = (a.y + b.y) / 2 - g.cy * zv.s;
+    applyZoom();
+  } else if (g.kind === 'pan') {
+    const dx = pts[0].x - g.p0.x, dy = pts[0].y - g.p0.y;
+    if (Math.hypot(dx, dy) > (e.pointerType === 'mouse' ? 4 : 10)) g.moved = true;
+    if (g.moved && zv.s > 1) {
+      zv.x = g.x0 + dx;
+      zv.y = g.y0 + dy;
+      applyZoom();
+    }
+  }
+});
+
+function endVideoPointer(e, cancelled) {
+  if (!vPointers.has(e.pointerId)) return;
+  vPointers.delete(e.pointerId);
+  const g = vGesture;
+  if (vPointers.size) {           // one finger of a pinch lifted: keep panning, it's no tap
+    startVideoGesture();
+    vGesture.moved = true;
+    return;
+  }
+  vGesture = null;
+  if (!cancelled && g?.kind === 'pan' && !g.moved) onVideoTap(localPt(e));
+}
+player.addEventListener('pointerup', (e) => endVideoPointer(e, false));
+player.addEventListener('pointercancel', (e) => endVideoPointer(e, true));
+
+player.addEventListener('wheel', (e) => {
+  if (onControl(e)) return;
+  e.preventDefault();
+  const p = localPt(e);
+  zoomVideoAt(p.x, p.y, zv.s * Math.exp(-e.deltaY * 0.002));
+}, { passive: false });
+
+new ResizeObserver(applyZoom).observe(player);
+$('zoomReset').onclick = resetVideoZoom;
+
+function onVideoTap(p) {
+  const t = performance.now();
+  const dir = p.x < player.clientWidth / 2 ? -1 : 1;
+  clearTimeout(tapTimer);
+  if (burst && t < burst.until && burst.dir === dir) { // already skipping: every tap adds 10 s
+    burst.n++;
+    burst.until = t + 700;
+    burstSkip();
+    return;
+  }
+  if (lastTap && t - lastTap.t < 300 && Math.hypot(p.x - lastTap.x, p.y - lastTap.y) < 80) {
+    lastTap = null;
+    if (dir > 0 && state.mode === 'live') return; // nothing to skip to
+    burst = { dir, n: 1, base: playheadTime(), autoplay: state.mode === 'live' || !video.paused, until: t + 700 };
+    burstSkip();
+    return;
+  }
+  lastTap = { t, x: p.x, y: p.y };
+  tapTimer = setTimeout(toggleControls, 300); // single tap (no second one came)
+}
+
+function burstSkip() {
+  const sec = burst.dir * SKIP * burst.n;
+  flashSeek(burst.dir, Math.abs(sec));
+  playAt(burst.base + sec, { dir: burst.dir, autoplay: burst.autoplay });
+}
+
+function flashSeek(dir, sec) {
+  const el = $('seekFlash');
+  el.className = 'seek-flash ' + (dir < 0 ? 'left' : 'right');
+  el.firstElementChild.textContent = dir < 0 ? 'fast_rewind' : 'fast_forward';
+  el.lastElementChild.textContent = `${sec} s`;
+  el.hidden = false;
+  el.getAnimations().forEach((a) => { a.cancel(); a.play(); });
+  clearTimeout(flashSeek.t);
+  flashSeek.t = setTimeout(() => (el.hidden = true), 700);
+}
+
+// ---- landscape: controls over the video, hidden after a few seconds of playback
+
+const landscape = matchMedia('(orientation: landscape) and (max-height: 500px)');
+const HIDE_CONTROLS_MS = 4000;
+let hideTimer = null;
+
+function showControls() {
+  document.body.classList.remove('controls-hidden');
+  clearTimeout(hideTimer);
+  if (landscape.matches) hideTimer = setTimeout(hideControls, HIDE_CONTROLS_MS);
+}
+
+function hideControls() {
+  const busy = drag || pinch || scrub || vGesture || !$('sheet').hidden ||
+               (state.mode === 'playback' && video.paused) || document.activeElement?.tagName === 'SELECT';
+  if (busy) showControls(); // check again later
+  else document.body.classList.add('controls-hidden');
+}
+
+function toggleControls() {
+  if (document.body.classList.contains('controls-hidden') || !landscape.matches) showControls();
+  else { clearTimeout(hideTimer); document.body.classList.add('controls-hidden'); }
+}
+
+// any touch on the controls (not the picture, that toggles them) keeps them up
+document.addEventListener('pointerdown', (e) => { if (!e.target.closest('#stage')) showControls(); }, true);
+document.addEventListener('pointermove', (e) => { if (e.pointerType === 'mouse') showControls(); });
+video.addEventListener('play', showControls);
+landscape.addEventListener('change', () => { readColors(); showControls(); });
+
 // --------------------------------------------------------------- controls
 
 $('play').onclick = togglePlay;
@@ -1094,7 +1350,10 @@ $('speed').onchange = (e) => {
 };
 $('fullscreen').onclick = () => {
   if (document.fullscreenElement) document.exitFullscreen();
-  else if (document.fullscreenEnabled) $('player').requestFullscreen().catch(() => {});
+  else if (document.fullscreenEnabled) {
+    // landscape: the whole page, so the controls over the video come along
+    (landscape.matches ? document.documentElement : $('player')).requestFullscreen().catch(() => {});
+  }
   else {
     const el = state.mode === 'live' ? liveVideo : video; // iPhone: only <video> can go fullscreen
     if (!el.hidden && el.webkitEnterFullscreen) el.webkitEnterFullscreen();
@@ -1136,6 +1395,7 @@ function selectCamera(cam) {
   try { savedStream = localStorage.getItem(`stream:${cam}`); } catch {}
   if (liveStreams.some((s) => s.name === savedStream)) sel.value = savedStream;
   thresholdDirty = true;
+  resetVideoZoom();
   try { localStorage.setItem('camera', cam); } catch {}
   cancelRecording();
   goLive();
@@ -1212,8 +1472,6 @@ $('logout').onclick = async () => {
 
 const INSTALL_SNOOZE_DAYS = 30;
 const isStandalone = matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
-const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
-              (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1); // iPadOS
 let installEvent = null;
 
 function installSnoozed() {
@@ -1300,6 +1558,7 @@ async function start() {
 }
 
 readColors();
+showControls();
 requestAnimationFrame(frame);
 setInterval(() => { dirty = true; ensureViewData(); }, 15000);
 // coming back to the installed app after a while: refresh live + timeline right away
